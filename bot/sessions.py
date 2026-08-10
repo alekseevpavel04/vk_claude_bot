@@ -23,6 +23,16 @@ class SessionInfo:
     updated_at: str
     turns: int = 0
 
+    def age_hours(self) -> float:
+        """Сколько часов прошло с последнего хода. inf, если время не разобрать."""
+        try:
+            stamp = datetime.fromisoformat(self.updated_at)
+        except ValueError:
+            return float("inf")
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - stamp).total_seconds() / 3600
+
 
 class SessionStore:
     def __init__(self, path: Path) -> None:
@@ -80,3 +90,27 @@ class SessionStore:
         if removed:
             self._save()
         return removed
+
+    def session_ids(self) -> list[str]:
+        return [info.session_id for info in self._data.values()]
+
+    def clear_all(self) -> list[str]:
+        """Забывает все разговоры. Возвращает id забытых сессий."""
+        removed = self.session_ids()
+        self._data.clear()
+        self._save()
+        return removed
+
+    def prune(self, ttl_hours: int) -> list[str]:
+        """Выбрасывает разговоры, в которых давно не писали."""
+        if ttl_hours <= 0:
+            return []
+        stale = {
+            peer: info for peer, info in self._data.items() if info.age_hours() > ttl_hours
+        }
+        for peer in stale:
+            del self._data[peer]
+        if stale:
+            self._save()
+            log.info("Просрочено разговоров: %s", len(stale))
+        return [info.session_id for info in stale.values()]

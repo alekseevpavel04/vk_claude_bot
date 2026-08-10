@@ -8,6 +8,7 @@ import logging
 import signal
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,11 +34,30 @@ HELP_TEXT = """\
 Умею искать в интернете, если вопрос про свежие данные.
 
 Команды:
-/new — начать разговор с чистого листа (забыть контекст)
-/stop — прервать текущий ответ
-/status — что сейчас происходит
+/new — забыть контекст этого разговора и начать заново
+/cancel — прервать ответ, который я сейчас пишу
+/limits — сколько потрачено лимитов подписки и когда обнулятся
+/status — чем занят прямо сейчас
+/clear — полная очистка: все разговоры и все файлы
+/stop — выключить меня на сервере (спрошу подтверждение)
 /help — это сообщение\
 """
+
+# Сколько секунд действует подтверждение /stop.
+STOP_CONFIRM_WINDOW = 120
+
+STOP_CONFIRM_REPLY = """\
+Точно выключить? Я остановлюсь целиком и сам обратно не поднимусь — ни после
+перезапуска контейнера, ни после перезагрузки сервера.
+
+Отправь /stop ещё раз в течение двух минут, если да.\
+"""
+
+STOP_REPLY = """\
+Выключаюсь. Включить обратно: ./deploy/deploy.sh start\
+"""
+
+CLEAR_INTRO = "Чищу всё: разговоры и файлы…"
 
 
 @dataclass
@@ -114,6 +134,16 @@ class PeerWorker:
             prompt = _build_prompt(job.text, attachments)
 
             stored = bot.sessions.get(self.peer_id)
+            if stored is not None and stored.age_hours() > bot.config.session_ttl_hours:
+                log.info(
+                    "Разговор с %s не обновлялся %.0f ч — начинаю с чистого листа",
+                    self.peer_id,
+                    stored.age_hours(),
+                )
+                await claude_runner.forget_sessions(bot.config.workspace, [stored.session_id])
+                bot.sessions.reset(self.peer_id)
+                stored = None
+
             result = await claude_runner.run_turn(
                 prompt=prompt,
                 cwd=bot.config.workspace,
@@ -125,6 +155,7 @@ class PeerWorker:
 
             if result.session_id:
                 bot.sessions.remember(self.peer_id, result.session_id)
+            bot.remember_limits(result.rate_limits)
 
             await bot.reply(self.peer_id, result.text)
             if result.cost_usd:
@@ -163,12 +194,32 @@ class Bot:
         vk: VkClient,
         media: MediaStore,
         sessions: SessionStore,
+        shutdown: asyncio.Event | None = None,
     ) -> None:
         self.config = config
         self.vk = vk
         self.media = media
         self.sessions = sessions
+        self.shutdown = shutdown or asyncio.Event()
+        # True, если выключение запрошено командой /stop, а не сигналом ОС.
+        self.killed = False
         self._workers: dict[int, PeerWorker] = {}
+        # Когда был первый /stop — второй в течение окна подтверждает выключение.
+        self._stop_asked_at: float | None = None
+        self._limits: dict[str, Any] = {}
+        self._limits_at = 0.0
+        # Долгие команды не должны блокировать приём событий Long Poll.
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def remember_limits(self, limits: dict[str, Any]) -> None:
+        if limits:
+            self._limits = limits
+            self._limits_at = time.monotonic()
 
     # --- отправка --------------------------------------------------------
 
@@ -231,6 +282,10 @@ class Bot:
     async def _command(self, peer_id: int, text: str) -> bool:
         command = text.split(maxsplit=1)[0].lower().lstrip("/")
 
+        # Любая команда, кроме повторного /stop, снимает запрос подтверждения.
+        if command != "stop":
+            self._stop_asked_at = None
+
         if command in {"help", "start", "помощь"}:
             await self.reply(peer_id, HELP_TEXT)
             return True
@@ -246,18 +301,83 @@ class Bot:
             )
             return True
 
-        if command in {"stop", "стоп"}:
+        if command in {"cancel", "отмена"}:
             worker = self._workers.get(peer_id)
             if worker is not None and worker.cancel_current():
                 return True  # сообщение отправит сам воркер, поймав CancelledError
-            await self.reply(peer_id, "Сейчас нечего останавливать.")
+            await self.reply(peer_id, "Сейчас нечего прерывать.")
+            return True
+
+        if command in {"stop", "стоп"}:
+            await self._stop(peer_id)
+            return True
+
+        if command in {"clear", "очистить"}:
+            self._spawn(self._clear(peer_id))
+            return True
+
+        if command in {"limits", "лимиты"}:
+            self._spawn(self._limits_report(peer_id))
             return True
 
         if command in {"status", "статус"}:
             await self.reply(peer_id, self._status(peer_id))
             return True
 
-        return False
+        await self.reply(peer_id, f"Не знаю команду /{command}. Что умею — /help")
+        return True
+
+    async def _stop(self, peer_id: int) -> None:
+        now = time.monotonic()
+        confirmed = (
+            self._stop_asked_at is not None and now - self._stop_asked_at <= STOP_CONFIRM_WINDOW
+        )
+        if not confirmed:
+            self._stop_asked_at = now
+            await self.reply(peer_id, STOP_CONFIRM_REPLY)
+            return
+
+        log.warning("Получена подтверждённая команда /stop — выключаюсь")
+        with contextlib.suppress(Exception):
+            await self.reply(peer_id, STOP_REPLY)
+        self.killed = True
+        self.shutdown.set()
+
+    async def _clear(self, peer_id: int) -> None:
+        await self.reply(peer_id, CLEAR_INTRO)
+
+        for worker in self._workers.values():
+            worker.cancel_current()
+
+        forgotten = len(self.sessions.clear_all())
+        # None — снести вообще все транскрипты в рабочей папке, включая те,
+        # про которые state.json уже не помнит.
+        transcripts = await claude_runner.forget_sessions(self.config.workspace, None)
+        files = await asyncio.to_thread(self.media.purge_all)
+
+        await self.reply(
+            peer_id,
+            "Готово, начинаем с нуля.\n"
+            f"— разговоров забыто: {forgotten}\n"
+            f"— транскриптов удалено: {transcripts}\n"
+            f"— файлов удалено: {files}",
+        )
+
+    async def _limits_report(self, peer_id: int) -> None:
+        fresh = self._limits and time.monotonic() - self._limits_at < 120
+        if not fresh:
+            with contextlib.suppress(Exception):
+                await self.vk.set_activity(peer_id)
+            try:
+                limits = await claude_runner.probe_rate_limits(
+                    cwd=self.config.workspace, model=self.config.claude_model
+                )
+            except Exception as exc:  # noqa: BLE001
+                await self.reply(peer_id, f"Не смог узнать лимиты: {exc}")
+                return
+            self.remember_limits(limits)
+
+        await self.reply(peer_id, claude_runner.describe_limits(self._limits))
 
     def _status(self, peer_id: int) -> str:
         worker = self._workers.get(peer_id)
@@ -270,12 +390,21 @@ class Bot:
         if worker is not None and worker.queued:
             lines.append(f"В очереди ещё сообщений: {worker.queued}.")
         if stored:
-            lines.append(f"Контекст: {stored.turns} ход(ов), последний {stored.updated_at}.")
+            age = stored.age_hours()
+            left = max(0.0, self.config.session_ttl_hours - age)
+            lines.append(
+                f"Контекст: {stored.turns} ход(ов), последний {age:.0f} ч назад. "
+                f"Сам обнулится через {left / 24:.0f} дн."
+            )
         else:
             lines.append("Контекст пустой.")
         return "\n".join(lines)
 
     async def close(self) -> None:
+        for task in list(self._tasks):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         for worker in self._workers.values():
             await worker.close()
 
@@ -298,6 +427,14 @@ def _build_prompt(text: str, attachments: list[Attachment]) -> str:
 
 async def run() -> None:
     config = load_config()
+
+    if config.kill_flag.exists():
+        log.warning(
+            "Бот выключен стоп-фразой (%s). Чтобы включить: ./deploy/deploy.sh start",
+            config.kill_flag,
+        )
+        return
+
     log.info(
         "Запуск: группа %s, разрешено пользователей: %s, рабочая папка %s",
         config.vk_group_id,
@@ -312,23 +449,48 @@ async def run() -> None:
             http, config.media_dir, config.max_attachment_bytes, config.media_ttl_days
         )
         sessions = SessionStore(config.state_file)
-        bot = Bot(config, vk, media, sessions)
-
-        media.purge_once()
-        purge_task = asyncio.create_task(media.purge_loop(), name="media-purge")
 
         stop = asyncio.Event()
         _install_signal_handlers(stop)
+        bot = Bot(config, vk, media, sessions, shutdown=stop)
+
+        media.purge_once()
+        await _prune_sessions(bot)
+        purge_task = asyncio.create_task(media.purge_loop(), name="media-purge")
+        prune_task = asyncio.create_task(_prune_loop(bot), name="session-prune")
 
         poller = asyncio.create_task(_poll(bot, vk), name="longpoll")
         await stop.wait()
 
         log.info("Останавливаюсь...")
-        for task in (poller, purge_task):
+        for task in (poller, purge_task, prune_task):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         await bot.close()
+
+        if bot.killed:
+            config.kill_flag.write_text(
+                f"Выключен стоп-фразой {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n",
+                encoding="utf-8",
+            )
+            log.warning("Записан %s — при следующем запуске бот сразу выйдет", config.kill_flag)
+
+
+async def _prune_sessions(bot: Bot) -> None:
+    """Выбрасывает разговоры, в которых давно молчат, вместе с транскриптами."""
+    stale = bot.sessions.prune(bot.config.session_ttl_hours)
+    if stale:
+        await claude_runner.forget_sessions(bot.config.workspace, stale)
+
+
+async def _prune_loop(bot: Bot, interval_seconds: int = 3600) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await _prune_sessions(bot)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Уборка разговоров не удалась: %s", exc)
 
 
 async def _poll(bot: Bot, vk: VkClient) -> None:

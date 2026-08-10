@@ -34,7 +34,14 @@ class Config:
     workspace: Path
     media_dir: Path
     state_file: Path
+    # Файл-метка «выключен стоп-фразой»: пока он есть, бот при старте сразу
+    # выходит. Лежит в workspace, поэтому переживает пересоздание контейнера.
+    kill_flag: Path
     media_ttl_days: int
+    # Через сколько часов простоя начинать разговор с чистого листа. Контекст
+    # копится с каждым ходом и стоит токенов, а недельная давность в личной
+    # переписке всё равно не нужна.
+    session_ttl_hours: int
     max_attachment_bytes: int
     max_turns: int
     show_tool_progress: bool
@@ -134,8 +141,12 @@ def load_config() -> Config:
         claude_model=os.environ.get("CLAUDE_MODEL", "").strip() or None,
         workspace=workspace,
         media_dir=media_dir,
-        state_file=ROOT / "state.json",
+        # Состояние лежит внутри workspace: так весь изменяемый стейт бота — это
+        # одна папка, которую достаточно смонтировать в контейнер одним томом.
+        state_file=workspace / "state.json",
+        kill_flag=workspace / ".killed",
         media_ttl_days=_int("MEDIA_TTL_DAYS", 7),
+        session_ttl_hours=_int("SESSION_TTL_HOURS", 168),
         max_attachment_bytes=_int("MAX_ATTACHMENT_MB", 20) * 1024 * 1024,
         max_turns=_int("MAX_TURNS", 30),
         show_tool_progress=_bool("SHOW_TOOL_PROGRESS", True),

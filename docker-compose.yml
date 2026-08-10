@@ -1,0 +1,38 @@
+# Имя проекта задано явно, чтобы контейнеры и тома бота не смешивались
+# с другими compose-проектами на этом сервере.
+name: vk-claude-bot
+
+services:
+  bot:
+    build: .
+    container_name: vk-claude-bot
+    env_file: .env
+    # PID 1 = init, иначе Python не получит SIGTERM при docker stop.
+    init: true
+
+    # Принципиально именно on-failure, а не unless-stopped:
+    #   падение (ненулевой код)      -> Docker поднимает обратно;
+    #   выключение стоп-фразой (код 0) -> контейнер остаётся остановленным.
+    # С unless-stopped стоп-фраза превратилась бы в бесконечный перезапуск.
+    restart: on-failure
+
+    volumes:
+      # Весь изменяемый стейт бота: state.json, скачанные вложения, метка kill.
+      - ./workspace:/app/workspace
+      # Транскрипты сессий Claude Code. Без этого тома контекст разговора
+      # терялся бы при каждой пересборке образа.
+      - claude-home:/home/bot/.claude
+
+    # Логи не должны съесть диск на сервере с соседними проектами.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Если VPS тесная — раскомментируй и подбери под себя.
+    # mem_limit: 1500m
+    # cpus: 1.0
+
+volumes:
+  claude-home:

@@ -156,21 +156,34 @@ class MediaStore:
 
     # --- уборка ----------------------------------------------------------
 
+    def _sweep(self, older_than: float | None) -> int:
+        """Удаляет файлы старше отметки (None — вообще все) и пустые папки."""
+        removed = 0
+        for path in list(self._dir.rglob("*")):
+            if not path.is_file():
+                continue
+            if older_than is not None and path.stat().st_mtime >= older_than:
+                continue
+            path.unlink(missing_ok=True)
+            removed += 1
+        for directory in sorted(self._dir.rglob("*"), reverse=True):
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+        return removed
+
     def purge_once(self) -> int:
         """Удаляет файлы старше TTL. Возвращает число удалённых."""
         if self._ttl_seconds <= 0:
             return 0
-        deadline = time.time() - self._ttl_seconds
-        removed = 0
-        for path in self._dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < deadline:
-                path.unlink(missing_ok=True)
-                removed += 1
-        for directory in sorted(self._dir.rglob("*"), reverse=True):
-            if directory.is_dir() and not any(directory.iterdir()):
-                directory.rmdir()
+        removed = self._sweep(time.time() - self._ttl_seconds)
         if removed:
             log.info("Удалено старых вложений: %s", removed)
+        return removed
+
+    def purge_all(self) -> int:
+        """Сносит все скачанные вложения — для команды /clear."""
+        removed = self._sweep(None)
+        log.info("Удалено вложений полностью: %s", removed)
         return removed
 
     async def purge_loop(self, interval_seconds: int = 3600) -> None:

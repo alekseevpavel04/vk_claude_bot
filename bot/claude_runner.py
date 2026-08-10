@@ -7,19 +7,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     CLINotFoundError,
+    RateLimitEvent,
+    RateLimitInfo,
     ResultMessage,
     TextBlock,
     ToolUseBlock,
+    delete_session,
+    list_sessions,
     query,
 )
 
@@ -30,25 +36,39 @@ log = logging.getLogger(__name__)
 TOOLS = ["Read", "Glob", "WebSearch", "WebFetch", "TodoWrite"]
 
 SYSTEM_PROMPT = """\
-Ты — личный ассистент, который общается с одним человеком в переписке ВКонтакте.
-Отвечай на русском, если собеседник не пишет на другом языке.
+Ты — личный ассистент одного человека. Вы переписываетесь ВКонтакте, он читает
+тебя с телефона.
 
-Формат ответа:
-- ВКонтакте не умеет markdown. Пиши обычным текстом.
-- Не используй **жирный**, ##заголовки, ```блоки кода``` и таблицы — они
-  отобразятся как мусорные символы. Код давай отдельными строками как есть.
-- Списки — обычными строками, можно начинать с «— » или «• ».
-- Это переписка с телефона: отвечай по делу и без длинных вступлений. Развёрнутый
-  ответ уместен, только если вопрос действительно этого требует.
+Как писать:
+- По-русски, если собеседник не пишет на другом языке.
+- Живым связным текстом, как пишут человеку в мессенджере, а не отчётом. Без
+  заголовков и без дробления каждой мысли в отдельный пункт.
+- Сразу ответом. Без вступлений вроде «Отличный вопрос», без концовок вроде
+  «уточни, если нужно», без напоминаний перепроверить информацию.
+- Коротко: обычно хватает пары предложений или небольшого абзаца. Разворачивайся,
+  только если человек просит разобраться подробно.
+- Список — когда перечисляешь действительно разные вещи, и тогда простыми
+  строками с «— » в начале. Связный рассказ в список не превращай.
+- Не описывай, как добывал ответ: какие сайты открывал, где не пустил доступ, чем
+  один источник отличается от другого. Это твоя кухня, читателю она не нужна.
+  Если чего-то выяснить не удалось — скажи это одной фразой.
+- Не приводи список источников в конце. Если ссылка важна сама по себе, вставь
+  голый адрес прямо в предложение.
+
+ВКонтакте не понимает markdown: **звёздочки**, ##заголовки, ```блоки кода```,
+таблицы и ссылки вида [текст](адрес) видны как мусорные символы. Пиши обычным
+текстом, код — просто отдельными строками.
 
 Инструменты:
-- Есть веб-поиск (WebSearch) и чтение страниц (WebFetch). Пользуйся ими, когда
-  вопрос про свежие события, цены, курсы, версии, документацию или когда точность
-  важнее скорости. Ссылайся на источник, если факт неочевиден.
-- Файлов на сервере ты не редактируешь и команд не выполняешь — таких инструментов
-  у тебя нет. Если просят что-то сделать на сервере, честно скажи, что не можешь.
-- Если в сообщении указан путь к вложению, прочитай его инструментом Read: так ты
-  увидишь присланное фото или документ.
+- WebSearch и WebFetch — когда вопрос про свежие события, цены, курсы, версии,
+  документацию, и вообще когда важна точность. Наугад отвечать не надо.
+- Read — читает присланные файлы и фотографии, пути к ним указаны в сообщении.
+  ВАЖНО про его формат: текстовые файлы Read показывает с номерами строк слева,
+  в виде «     5→содержимое строки». Номер и стрелку дорисовывает сам инструмент,
+  в файле их нет. Никогда не принимай их за содержимое: если в файле числа, то
+  номера строк к этим числам отношения не имеют и в подсчёты не идут.
+- Файлы ты не редактируешь и команды не выполняешь — таких инструментов у тебя
+  нет. Если просят сделать что-то на сервере, честно скажи, что не можешь.
 """
 
 # Как показывать вызовы инструментов в чате.
@@ -67,6 +87,8 @@ class TurnResult:
     session_id: str | None
     is_error: bool
     cost_usd: float | None
+    # Состояние лимитов подписки, если API его прислало по ходу запроса.
+    rate_limits: dict[str, RateLimitInfo] = field(default_factory=dict)
 
 
 def describe_tool(block: ToolUseBlock) -> str | None:
@@ -133,10 +155,14 @@ async def run_turn(
     cost: float | None = None
     result_text: str | None = None
     fatal: str | None = None
+    limits: dict[str, RateLimitInfo] = {}
 
     try:
         async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
+            if isinstance(message, RateLimitEvent):
+                info = message.rate_limit_info
+                limits[info.rate_limit_type or "unknown"] = info
+            elif isinstance(message, AssistantMessage):
                 if message.error:
                     fatal = _explain_error(message.error)
                 for block in message.content:
@@ -164,7 +190,9 @@ async def run_turn(
         ) from exc
 
     if fatal:
-        return TurnResult(text=fatal, session_id=session_id, is_error=True, cost_usd=cost)
+        return TurnResult(
+            text=fatal, session_id=session_id, is_error=True, cost_usd=cost, rate_limits=limits
+        )
 
     text = (result_text or "").strip() or "\n\n".join(collected).strip()
     if not text:
@@ -174,7 +202,106 @@ async def run_turn(
         )
         is_error = True
 
-    return TurnResult(text=text, session_id=session_id, is_error=is_error, cost_usd=cost)
+    return TurnResult(
+        text=text, session_id=session_id, is_error=is_error, cost_usd=cost, rate_limits=limits
+    )
+
+
+# --- лимиты подписки ------------------------------------------------------
+
+_LIMIT_NAMES = {
+    "five_hour": "текущее пятичасовое окно",
+    "seven_day": "неделя",
+    "seven_day_opus": "неделя, Opus",
+    "seven_day_sonnet": "неделя, Sonnet",
+    "overage": "перерасход",
+}
+
+
+def _human_delay(seconds: float) -> str:
+    if seconds < 60:
+        return "меньше минуты"
+    # Округляем, а не обрезаем: «3 ч 19 мин» вместо ожидаемых 3 ч 20 мин выглядит
+    # как ошибка, хотя разница в доли секунды.
+    minutes = int(round(seconds / 60))
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+    days, hours = divmod(hours, 24)
+    return f"{days} дн {hours} ч" if hours else f"{days} дн"
+
+
+def describe_limits(limits: dict[str, RateLimitInfo]) -> str:
+    if not limits:
+        return (
+            "Claude не прислал данные о лимитах — так бывает, когда до потолка ещё далеко. "
+            "Значит, беспокоиться не о чем."
+        )
+
+    now = time.time()
+    lines: list[str] = []
+    for kind, info in sorted(limits.items()):
+        name = _LIMIT_NAMES.get(kind, kind)
+        parts: list[str] = []
+        if info.utilization is not None:
+            # API отдаёт долю в диапазоне 0..1 либо сразу проценты.
+            percent = info.utilization * 100 if info.utilization <= 1 else info.utilization
+            parts.append(f"потрачено {percent:.0f}%")
+        if info.resets_at:
+            left = info.resets_at - now
+            parts.append(f"обнулится через {_human_delay(left)}" if left > 0 else "уже обнулился")
+        if info.status == "rejected":
+            parts.append("ЛИМИТ ИСЧЕРПАН")
+        elif info.status == "allowed_warning":
+            parts.append("близко к пределу")
+        lines.append(f"— {name}: {', '.join(parts)}" if parts else f"— {name}: данных нет")
+
+    text = "Лимиты подписки Claude:\n" + "\n".join(lines)
+    if all(info.utilization is None for info in limits.values()):
+        # Процент расхода API присылает только когда он становится заметным.
+        text += "\nПроцент расхода не показывают — значит, до потолка ещё далеко."
+    return text
+
+
+async def probe_rate_limits(*, cwd: Path, model: str | None) -> dict[str, RateLimitInfo]:
+    """Самый дешёвый запрос, ради которого API сообщит текущие лимиты."""
+    result = await run_turn(
+        prompt="Ответь одним словом: ок",
+        cwd=cwd,
+        resume=None,
+        model=model,
+        max_turns=1,
+    )
+    return result.rate_limits
+
+
+# --- удаление разговоров --------------------------------------------------
+
+
+def _forget_blocking(cwd: Path, session_ids: list[str] | None) -> int:
+    directory = str(cwd)
+    if session_ids is None:
+        try:
+            session_ids = [item.session_id for item in list_sessions(directory=directory)]
+        except Exception as exc:  # noqa: BLE001 — отсутствие транскриптов не ошибка
+            log.warning("Не удалось перечислить сессии Claude: %s", exc)
+            return 0
+
+    removed = 0
+    for session_id in session_ids:
+        try:
+            delete_session(session_id, directory=directory)
+            removed += 1
+        except Exception as exc:  # noqa: BLE001 — часть могла исчезнуть сама
+            log.debug("Сессия %s не удалена: %s", session_id, exc)
+    return removed
+
+
+async def forget_sessions(cwd: Path, session_ids: list[str] | None = None) -> int:
+    """Стирает транскрипты разговоров с диска. None — стереть все в этой папке."""
+    return await asyncio.to_thread(_forget_blocking, cwd, session_ids)
 
 
 def _explain_error(kind: str) -> str:

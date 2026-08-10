@@ -1,0 +1,13 @@
+.git
+.gitignore
+.gitattributes
+.venv
+venv
+workspace
+state.json
+.env
+deploy
+README.md
+__pycache__
+**/__pycache__
+*.pyc

@@ -17,16 +17,28 @@ _BOLD_ALT = re.compile(r"__(.+?)__", re.DOTALL)
 _INLINE_CODE = re.compile(r"`([^`\n]+)`")
 _BULLET = re.compile(r"^(\s*)[*+]\s+", re.MULTILINE)
 _BLANK_RUN = re.compile(r"\n{3,}")
+_MD_LINK = re.compile(r"\[([^\]\n]*)\]\(\s*(<?)(https?://[^\s)>]+)\2\s*\)")
+_AUTOLINK = re.compile(r"<(https?://[^\s>]+)>")
+
+
+def _unlink(match: re.Match[str]) -> str:
+    """[текст](адрес) -> «текст — адрес»; ВК кликабельные ссылки делает сам."""
+    label, url = match.group(1).strip(), match.group(3)
+    if not label or label == url:
+        return url
+    return f"{label} — {url}"
 
 
 def to_plain_text(text: str) -> str:
     """Убирает markdown-разметку, которую ВК показал бы как мусорные символы."""
     text = _FENCE.sub("", text)
     text = _HEADING.sub("", text)
+    text = _MD_LINK.sub(_unlink, text)
+    text = _AUTOLINK.sub(r"\1", text)
     text = _BOLD.sub(r"\1", text)
     text = _BOLD_ALT.sub(r"\1", text)
     text = _INLINE_CODE.sub(r"\1", text)
-    text = _BULLET.sub(r"\1• ", text)
+    text = _BULLET.sub(r"\1— ", text)
     text = _BLANK_RUN.sub("\n\n", text)
     return text.strip()
 

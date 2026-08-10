@@ -1,5 +1,6 @@
 # secrets
 .env
+deploy/deploy.env
 
 # runtime state and downloaded attachments
 workspace/
