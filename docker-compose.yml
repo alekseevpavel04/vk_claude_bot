@@ -17,11 +17,14 @@ services:
     restart: on-failure
 
     volumes:
-      # Весь изменяемый стейт бота: state.json, скачанные вложения, метка kill.
+      # Весь изменяемый стейт бота: state.json, вложения, метка kill и — в
+      # claude-home — транскрипты сессий Claude Code, на которых держится resume.
+      #
+      # Именно bind-mount, а не именованный том: том Docker создаёт от root, и
+      # процесс под uid 10001 не может в него писать. Здесь права выставляет
+      # deploy.sh при заливке, и весь стейт лежит одной папкой.
       - ./workspace:/app/workspace
-      # Транскрипты сессий Claude Code. Без этого тома контекст разговора
-      # терялся бы при каждой пересборке образа.
-      - claude-home:/home/bot/.claude
+      - ./workspace/claude-home:/home/bot/.claude
 
     # Логи не должны съесть диск на сервере с соседними проектами.
     logging:
@@ -33,6 +36,3 @@ services:
     # Если VPS тесная — раскомментируй и подбери под себя.
     # mem_limit: 1500m
     # cpus: 1.0
-
-volumes:
-  claude-home:

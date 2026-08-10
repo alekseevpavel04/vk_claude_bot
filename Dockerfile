@@ -28,8 +28,10 @@ COPY scripts ./scripts
 
 # Работаем не от root. uid фиксирован: deploy.sh отдаёт ему права на workspace
 # на стороне хоста, иначе в примонтированную папку не записать.
+# .claude создаём заранее и отдаём боту: иначе Docker создаст её при монтировании
+# от root, и CLI не сможет писать транскрипты сессий.
 RUN useradd --create-home --uid 10001 bot \
-    && mkdir -p /app/workspace \
+    && mkdir -p /app/workspace /home/bot/.claude \
     && chown -R bot:bot /app /home/bot
 
 USER bot

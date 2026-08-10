@@ -106,6 +106,13 @@ def describe_tool(block: ToolUseBlock) -> str | None:
     return f"{label}: {value}"
 
 
+def _log_stderr(line: str) -> None:
+    """Без этого падение CLI видно только как «exit code 1» без причины."""
+    line = line.strip()
+    if line:
+        log.warning("claude stderr: %s", line)
+
+
 def _build_options(
     *,
     cwd: Path,
@@ -134,6 +141,7 @@ def _build_options(
         max_turns=max_turns,
         model=model,
         env=env,
+        stderr=_log_stderr,
     )
 
 

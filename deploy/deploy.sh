@@ -115,8 +115,9 @@ sync_code() {
     remote_in "${SUDO}tee '$REMOTE_DIR/.env' >/dev/null && ${SUDO}chmod 600 '$REMOTE_DIR/.env'" \
         < "$PROJECT_DIR/.env"
 
-    # Контейнер работает под uid 10001 и должен писать в примонтированную папку.
-    remote "${SUDO}mkdir -p '$REMOTE_DIR/workspace' \
+    # Контейнер работает под uid 10001 и должен писать в примонтированные папки:
+    # workspace (состояние, вложения) и workspace/claude-home (транскрипты сессий).
+    remote "${SUDO}mkdir -p '$REMOTE_DIR/workspace/claude-home' \
         && ${SUDO}chown -R $CONTAINER_UID:$CONTAINER_UID '$REMOTE_DIR/workspace'"
     echo "код на месте"
 }
