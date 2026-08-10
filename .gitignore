@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# runtime state and downloaded attachments
+workspace/
+state.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
