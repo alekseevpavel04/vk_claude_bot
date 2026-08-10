@@ -43,6 +43,44 @@ class Attachment:
     note: str | None = None
 
 
+@dataclass(frozen=True)
+class MessagePart:
+    """Само сообщение или вложенное в него — пересланное либо ответ."""
+
+    label: str  # пусто для самого сообщения
+    text: str
+    attachments: list[Attachment]
+
+
+# Пересланное может тянуть за собой цепочку; ограничиваем, чтобы одно сообщение
+# не развернулось в сотню кусков и не съело контекст.
+MAX_PARTS = 12
+MAX_DEPTH = 3
+
+
+def _walk(message: dict[str, Any], label: str, depth: int, out: list[tuple[str, dict]]) -> None:
+    out.append((label, message))
+    if depth >= MAX_DEPTH or len(out) >= MAX_PARTS:
+        return
+
+    reply = message.get("reply_message")
+    if isinstance(reply, dict):
+        _walk(reply, "Ответ на сообщение", depth + 1, out)
+
+    for forwarded in message.get("fwd_messages") or []:
+        if len(out) >= MAX_PARTS:
+            break
+        if isinstance(forwarded, dict):
+            _walk(forwarded, "Пересланное сообщение", depth + 1, out)
+
+
+def raw_parts(message: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Сообщение вместе с пересланными и ответом, по порядку вложенности."""
+    out: list[tuple[str, dict[str, Any]]] = []
+    _walk(message, "", 0, out)
+    return out
+
+
 class MediaStore:
     def __init__(
         self,
@@ -58,13 +96,35 @@ class MediaStore:
 
     # --- разбор вложений -------------------------------------------------
 
+    async def collect_parts(
+        self, peer_id: int, message_id: int, message: dict[str, Any]
+    ) -> list[MessagePart]:
+        """Разбирает сообщение вместе с пересланными и ответом."""
+        parts: list[MessagePart] = []
+        for order, (label, raw) in enumerate(raw_parts(message)):
+            attachments = await self.collect(
+                peer_id, message_id, raw.get("attachments") or [], part=order
+            )
+            parts.append(
+                MessagePart(
+                    label=label,
+                    text=(raw.get("text") or "").strip(),
+                    attachments=attachments,
+                )
+            )
+        return parts
+
     async def collect(
-        self, peer_id: int, message_id: int, attachments: list[dict[str, Any]]
+        self,
+        peer_id: int,
+        message_id: int,
+        attachments: list[dict[str, Any]],
+        part: int = 0,
     ) -> list[Attachment]:
         result: list[Attachment] = []
         for index, attachment in enumerate(attachments):
             try:
-                item = await self._one(peer_id, message_id, index, attachment)
+                item = await self._one(peer_id, message_id, f"{part}-{index}", attachment)
             except Exception as exc:  # noqa: BLE001 — вложение не должно ронять ответ
                 log.warning("Не удалось обработать вложение %s: %s", attachment.get("type"), exc)
                 item = Attachment(kind=attachment.get("type", "?"), note="не удалось загрузить")
@@ -73,7 +133,7 @@ class MediaStore:
         return result
 
     async def _one(
-        self, peer_id: int, message_id: int, index: int, attachment: dict[str, Any]
+        self, peer_id: int, message_id: int, index: str, attachment: dict[str, Any]
     ) -> Attachment | None:
         kind = attachment.get("type", "")
         body = attachment.get(kind) or {}
@@ -120,7 +180,7 @@ class MediaStore:
         self,
         peer_id: int,
         message_id: int,
-        index: int,
+        index: str,
         url: str,
         *,
         default_ext: str,

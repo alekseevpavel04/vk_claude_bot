@@ -18,7 +18,7 @@ import aiohttp
 from . import claude_runner, formatting
 from .config import Config, ConfigError, load_config
 from .http import make_session
-from .media import Attachment, MediaStore
+from .media import MediaStore, MessagePart
 from .sessions import SessionStore
 from .vk import VkClient, iter_events
 
@@ -81,9 +81,10 @@ CLEAR_INTRO = "Чищу всё: разговоры и файлы…"
 
 @dataclass
 class Job:
-    text: str
+    # Всё сообщение целиком: внутри могут быть пересланные и ответ, а их нужно
+    # разбирать наравне с самим текстом.
+    message: dict[str, Any]
     message_id: int
-    attachments: list[dict[str, Any]]
 
 
 class PeerWorker:
@@ -166,8 +167,8 @@ class PeerWorker:
         typing = asyncio.create_task(bot.keep_typing(self.peer_id))
         progress = _ProgressReporter(bot, self.peer_id)
         try:
-            attachments = await bot.media.collect(self.peer_id, job.message_id, job.attachments)
-            prompt = _build_prompt(job.text, attachments)
+            parts = await bot.media.collect_parts(self.peer_id, job.message_id, job.message)
+            prompt = _build_prompt(parts)
 
             stored = bot.sessions.get(self.peer_id)
             if stored is not None and stored.age_hours() > bot.config.session_ttl_hours:
@@ -341,13 +342,15 @@ class Bot:
             if handled:
                 return
 
-        job = Job(
-            text=text,
-            message_id=message_id,
-            attachments=message.get("attachments") or [],
+        has_content = bool(
+            text
+            or message.get("attachments")
+            or message.get("fwd_messages")
+            or message.get("reply_message")
         )
-        if not job.text and not job.attachments:
+        if not has_content:
             return
+        job = Job(message=message, message_id=message_id)
 
         worker = self._worker(peer_id)
         if not worker.submit(job):
@@ -521,20 +524,31 @@ class Bot:
             await worker.close()
 
 
-def _build_prompt(text: str, attachments: list[Attachment]) -> str:
-    parts: list[str] = [text or "(сообщение без текста)"]
+def _build_prompt(parts: list[MessagePart]) -> str:
+    blocks: list[str] = []
+    files: list[str] = []
+    notes: list[str] = []
 
-    files = [item for item in attachments if item.path is not None]
-    notes = [item for item in attachments if item.path is None and item.note]
+    for index, part in enumerate(parts):
+        if index == 0:
+            blocks.append(part.text or "(сообщение без текста)")
+        elif part.text or part.attachments:
+            header = part.label or "Вложенное сообщение"
+            blocks.append(f"{header}:\n{part.text}" if part.text else f"{header}: без текста")
+
+        source = f" (из: {part.label.lower()})" if part.label else ""
+        for item in part.attachments:
+            if item.path is not None:
+                files.append(f"- {item.path}{source}")
+            elif item.note:
+                notes.append(f"- {item.kind}: {item.note}{source}")
 
     if files:
-        listing = "\n".join(f"- {item.path}" for item in files)
-        parts.append("Приложенные файлы (прочитай их инструментом Read):\n" + listing)
+        blocks.append("Приложенные файлы (прочитай их инструментом Read):\n" + "\n".join(files))
     if notes:
-        listing = "\n".join(f"- {item.kind}: {item.note}" for item in notes)
-        parts.append("Прочие вложения:\n" + listing)
+        blocks.append("Прочие вложения:\n" + "\n".join(notes))
 
-    return "\n\n".join(parts)
+    return "\n\n".join(blocks)
 
 
 async def run() -> None:

@@ -8,13 +8,16 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
+import socket
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -64,6 +67,12 @@ SYSTEM_PROMPT = """\
 Инструменты:
 - WebSearch и WebFetch — когда вопрос про свежие события, цены, курсы, версии,
   документацию, и вообще когда важна точность. Наугад отвечать не надо.
+- В сообщении могут быть пересланные сообщения и ответы на чужие реплики — они
+  идут отдельными блоками с пометкой «Пересланное сообщение» или «Ответ на
+  сообщение». Это часть вопроса: смотри их, не переспрашивай.
+- Голосовые ты не слышишь. Иногда ВК прикладывает к ним свою расшифровку
+  («расшифровка: …») — тогда работай с ней. Если её нет, скажи, что голосовое
+  недоступно, и попроси написать текстом.
 - Read — читает присланные файлы и фотографии, пути к ним указаны в сообщении.
   ВАЖНО про его формат: текстовые файлы Read показывает с номерами строк слева,
   в виде «     5→содержимое строки». Номер и стрелку дорисовывает сам инструмент,
@@ -116,7 +125,30 @@ def _log_stderr(line: str) -> None:
         log.warning("claude stderr: %s", line)
 
 
-def _make_read_guard(workspace: Path):
+def _resolves_to_private(host: str) -> bool:
+    """Ведёт ли адрес во внутреннюю сеть (loopback, LAN, метаданные облака).
+
+    Проверяется и то, во что имя резолвится: иначе достаточно любого домена,
+    указывающего на 169.254.169.254 или 172.17.0.1.
+    """
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False  # не резолвится — пусть WebFetch сам разбирается
+    for info in infos:
+        try:
+            if not ipaddress.ip_address(info[4][0]).is_global:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _make_tool_guard(workspace: Path):
     """Хук, пропускающий Read только внутри рабочей папки.
 
     Именно хук, а не can_use_tool: тот вызывается лишь для инструментов, по
@@ -133,22 +165,33 @@ def _make_read_guard(workspace: Path):
     async def guard(
         input_data: dict[str, Any], tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
-        if input_data.get("tool_name") != "Read":
-            return {}
-
-        raw = (input_data.get("tool_input") or {}).get("file_path")
+        tool_name = input_data.get("tool_name")
+        tool_input = input_data.get("tool_input") or {}
         verdict: str | None = None
-        if not isinstance(raw, str) or not raw:
-            verdict = "Не указан путь к файлу."
-        else:
-            try:
-                target = Path(raw).resolve()
-            except (OSError, ValueError):
-                verdict = "Некорректный путь."
+
+        if tool_name == "Read":
+            raw = tool_input.get("file_path")
+            if not isinstance(raw, str) or not raw:
+                verdict = "Не указан путь к файлу."
             else:
-                if target != root and root not in target.parents:
-                    log.warning("Отклонено чтение вне рабочей папки: %s", target)
-                    verdict = "Читать можно только файлы, присланные в этой переписке."
+                try:
+                    target = Path(raw).resolve()
+                except (OSError, ValueError):
+                    verdict = "Некорректный путь."
+                else:
+                    if target != root and root not in target.parents:
+                        log.warning("Отклонено чтение вне рабочей папки: %s", target)
+                        verdict = "Читать можно только файлы, присланные в этой переписке."
+
+        elif tool_name == "WebFetch":
+            # Контейнер видит внутреннюю сеть сервера: метаданные облака,
+            # соседние сервисы на хосте. WebFetch — единственный инструмент,
+            # которым туда можно попасть, в том числе по ссылке со страницы.
+            url = tool_input.get("url")
+            host = urlparse(url).hostname if isinstance(url, str) else None
+            if host and await asyncio.to_thread(_resolves_to_private, host):
+                log.warning("Отклонён запрос во внутреннюю сеть: %s", url)
+                verdict = "Во внутреннюю сеть сервера ходить нельзя, только в интернет."
 
         if verdict is None:
             return {}
@@ -185,7 +228,7 @@ def _build_options(
         # Всё, чего нет в tools, отклоняется молча: спрашивать человека в
         # переписке всё равно некого. Пути для Read проверяет хук ниже.
         permission_mode="dontAsk",
-        hooks={"PreToolUse": [HookMatcher(matcher="Read", hooks=[_make_read_guard(cwd)])]},
+        hooks={"PreToolUse": [HookMatcher(hooks=[_make_tool_guard(cwd)])]},
         setting_sources=[],
         cwd=str(cwd),
         resume=resume,

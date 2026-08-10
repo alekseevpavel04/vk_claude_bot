@@ -10,6 +10,7 @@ Claude. Секреты не печатает — только формат и д
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 import subprocess
@@ -123,6 +124,11 @@ async def check_claude_turn(config) -> None:
     except Exception as exc:  # noqa: BLE001
         report(FAIL, "Ответ Claude", str(exc))
         return
+
+    # Проверка не должна оставлять после себя транскрипт разговора из одной фразы.
+    if result.session_id:
+        with contextlib.suppress(Exception):
+            await claude_runner.forget_sessions(config.workspace, [result.session_id])
 
     answer = result.text.replace("\n", " ")[:80]
     if result.is_error:

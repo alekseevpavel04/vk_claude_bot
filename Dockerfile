@@ -3,13 +3,18 @@
 # проекты бот не задевает.
 FROM node:22-bookworm-slim
 
+# Версия CLI зафиксирована: иначе очередная пересборка молча привозит новую,
+# и если в ней что-то изменилось, ломается уже работавший бот.
+# Обновлять осознанно: поменять число здесь и прогнать deploy.sh update.
+ARG CLAUDE_CODE_VERSION=2.1.226
+
 # Claude Code CLI — Python SDK запускает его подпроцессом.
 # git нужен самому CLI для части операций; ca-certificates — для HTTPS.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 python3-venv ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
 
 WORKDIR /app
