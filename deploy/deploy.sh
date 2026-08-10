@@ -46,7 +46,7 @@ VPS_USER="${VPS_USER:-root}"
 VPS_PORT="${VPS_PORT:-22}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/vk_claude_bot}"
 
-SSH_OPTS=(-p "$VPS_PORT" -o ConnectTimeout=15)
+SSH_OPTS=(-p "$VPS_PORT" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
 if [[ -n "${SSH_KEY:-}" ]]; then
     SSH_OPTS+=(-i "${SSH_KEY/#\~/$HOME}")
 fi
@@ -54,7 +54,10 @@ fi
 # Не-root пользователю нужен sudo для Docker и записи в /opt.
 if [[ "$VPS_USER" == "root" ]]; then SUDO=""; else SUDO="sudo "; fi
 
-remote()     { ssh "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" "$@"; }
+# -n обязателен: без него ssh вычитывает наш stdin и съедает ответы на
+# последующие вопросы read. Для передачи данных на сервер есть remote_in.
+remote()     { ssh -n "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" "$@"; }
+remote_in()  { ssh "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" "$@"; }
 remote_tty() { ssh -t "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" "$@"; }
 compose()    { remote "cd '$REMOTE_DIR' && ${SUDO}docker compose $*"; }
 
@@ -106,10 +109,10 @@ sync_code() {
         --exclude=deploy/deploy.env \
         --exclude=__pycache__ \
         --exclude='*.pyc' \
-        . | remote "${SUDO}tar -xzf - -C '$REMOTE_DIR'"
+        . | remote_in "${SUDO}tar -xzf - -C '$REMOTE_DIR'"
 
     step "Заливаю .env (права 600)"
-    remote "${SUDO}tee '$REMOTE_DIR/.env' >/dev/null && ${SUDO}chmod 600 '$REMOTE_DIR/.env'" \
+    remote_in "${SUDO}tee '$REMOTE_DIR/.env' >/dev/null && ${SUDO}chmod 600 '$REMOTE_DIR/.env'" \
         < "$PROJECT_DIR/.env"
 
     # Контейнер работает под uid 10001 и должен писать в примонтированную папку.
