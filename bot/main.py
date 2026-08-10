@@ -15,6 +15,7 @@ import aiohttp
 
 from . import claude_runner, formatting
 from .config import Config, ConfigError, load_config
+from .http import make_session
 from .media import Attachment, MediaStore
 from .sessions import SessionStore
 from .vk import VkClient, iter_events
@@ -305,7 +306,7 @@ async def run() -> None:
     )
 
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=60)
-    async with aiohttp.ClientSession(timeout=timeout) as http:
+    async with make_session(timeout) as http:
         vk = VkClient(http, config.vk_token, config.vk_group_id)
         media = MediaStore(
             http, config.media_dir, config.max_attachment_bytes, config.media_ttl_days

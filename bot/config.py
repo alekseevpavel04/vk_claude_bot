@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -35,6 +38,13 @@ class Config:
     max_attachment_bytes: int
     max_turns: int
     show_tool_progress: bool
+    # Значение из .env осталось шаблонным (иксы из .env.example).
+    claude_token_is_placeholder: bool
+
+
+def is_placeholder(value: str) -> bool:
+    """Значение выглядит как незаполненный шаблон из .env.example."""
+    return "xxxx" in value.lower()
 
 
 def _require(name: str) -> str:
@@ -42,6 +52,10 @@ def _require(name: str) -> str:
     if not value:
         raise ConfigError(
             f"В .env не задан {name}. Скопируй .env.example в .env и заполни."
+        )
+    if is_placeholder(value):
+        raise ConfigError(
+            f"В .env значение {name} осталось шаблонным из .env.example — подставь настоящее."
         )
     return value
 
@@ -84,8 +98,24 @@ def _user_ids(raw: str) -> frozenset[int]:
     return frozenset(ids)
 
 
+def _claude_token_is_placeholder() -> bool:
+    """Шаблонный токен хуже отсутствующего: он перебьёт рабочую авторизацию
+    из ~/.claude и даст невнятную ошибку аутентификации. Убираем его из
+    окружения, чтобы SDK взял настоящие креды, если они есть."""
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if token and is_placeholder(token):
+        log.warning(
+            "CLAUDE_CODE_OAUTH_TOKEN в .env остался шаблонным — игнорирую его. "
+            "Получи настоящий командой `claude setup-token`."
+        )
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        return True
+    return False
+
+
 def load_config() -> Config:
     load_dotenv(ROOT / ".env")
+    token_is_placeholder = _claude_token_is_placeholder()
 
     workspace = ROOT / "workspace"
     media_dir = workspace / "media"
@@ -109,4 +139,5 @@ def load_config() -> Config:
         max_attachment_bytes=_int("MAX_ATTACHMENT_MB", 20) * 1024 * 1024,
         max_turns=_int("MAX_TURNS", 30),
         show_tool_progress=_bool("SHOW_TOOL_PROGRESS", True),
+        claude_token_is_placeholder=token_is_placeholder,
     )
