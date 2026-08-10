@@ -117,7 +117,7 @@ sync_code() {
 
     # Контейнер работает под uid 10001 и должен писать в примонтированные папки:
     # workspace (состояние, вложения) и workspace/claude-home (транскрипты сессий).
-    remote "${SUDO}mkdir -p '$REMOTE_DIR/workspace/claude-home' \
+    remote "${SUDO}mkdir -p '$REMOTE_DIR/workspace/home' \
         && ${SUDO}chown -R $CONTAINER_UID:$CONTAINER_UID '$REMOTE_DIR/workspace'"
     echo "код на месте"
 }

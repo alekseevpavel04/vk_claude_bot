@@ -134,22 +134,26 @@ class MediaStore:
             base = default_ext
         path = target_dir / f"{stamp}-{message_id}-{index}-{base}.{default_ext}"
 
-        async with self._session.get(url) as response:
-            response.raise_for_status()
+        # Любой сбой посреди загрузки не должен оставлять обрезанный файл: Claude
+        # прочитал бы его как настоящий и молча ответил по половине данных.
+        try:
+            async with self._session.get(url) as response:
+                response.raise_for_status()
 
-            declared = response.content_length
-            if declared is not None and declared > self._max_bytes:
-                raise ValueError(f"вложение больше лимита ({declared} байт)")
+                declared = response.content_length
+                if declared is not None and declared > self._max_bytes:
+                    raise ValueError(f"вложение больше лимита ({declared} байт)")
 
-            written = 0
-            with path.open("wb") as handle:
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    written += len(chunk)
-                    if written > self._max_bytes:
-                        handle.close()
-                        path.unlink(missing_ok=True)
-                        raise ValueError("вложение больше лимита")
-                    handle.write(chunk)
+                written = 0
+                with path.open("wb") as handle:
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        written += len(chunk)
+                        if written > self._max_bytes:
+                            raise ValueError("вложение больше лимита")
+                        handle.write(chunk)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
 
         log.info("Скачано вложение %s (%s байт)", path.name, written)
         return path

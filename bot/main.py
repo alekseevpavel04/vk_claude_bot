@@ -7,6 +7,7 @@ import contextlib
 import logging
 import signal
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,11 +43,17 @@ HELP_TEXT = """\
 /clear — полная очистка: все разговоры и все файлы
 /help — это сообщение
 
-О расходе лимитов предупрежу сам на 25, 50, 75, 90 и 100 процентах.\
+Предупрежу сам, когда подписка подойдёт к лимиту или он кончится.\
 """
 
 # Сколько секунд действует подтверждение /stop.
 STOP_CONFIRM_WINDOW = 120
+
+# peer_id беседы начинается с этого числа; всё, что меньше — личная переписка.
+CHAT_PEER_BASE = 2_000_000_000
+
+# Сколько id обработанных сообщений помнить ради защиты от повторов.
+SEEN_MESSAGES_LIMIT = 500
 
 STOP_CONFIRM_REPLY = """\
 Точно выключить? Я остановлюсь целиком и сам обратно не поднимусь — ни после
@@ -118,14 +125,27 @@ class PeerWorker:
                 # Отменён именно ход (командой /stop), а не весь воркер.
                 if self._loop_task is not None and self._loop_task.cancelling():
                     raise
-                await self._bot.reply(self.peer_id, "Остановил. Что дальше?")
+                await self._say(self.peer_id, "Остановил. Что дальше?")
             except Exception as exc:  # noqa: BLE001 — воркер должен пережить любой сбой
                 log.exception("Ошибка при обработке сообщения от %s", self.peer_id)
-                await self._bot.reply(self.peer_id, f"Что-то сломалось: {exc}")
+                await self._say(self.peer_id, f"Что-то сломалось: {exc}")
             finally:
                 self._turn_task = None
                 self.busy_since = None
                 self._queue.task_done()
+
+    async def _say(self, peer_id: int, text: str) -> None:
+        """Отправка, которая не может убить воркер.
+
+        Сообщения об ошибке шлются из блока except: если сама отправка упадёт
+        (сеть, флуд-контроль, запрет писать этому человеку), исключение вылетит
+        из цикла и воркер молча умрёт — дальше этот собеседник не дождётся
+        вообще ничего.
+        """
+        try:
+            await self._bot.reply(peer_id, text)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось отправить сообщение в %s", peer_id)
 
     async def _handle(self, job: Job) -> None:
         bot = self._bot
@@ -216,6 +236,19 @@ class Bot:
         self._limit_marks: dict[str, int] = {}
         # Долгие команды не должны блокировать приём событий Long Poll.
         self._tasks: set[asyncio.Task[None]] = set()
+        # id уже обработанных сообщений: Long Poll при переподключении может
+        # повторить события, а дважды отвеченный вопрос — двойной расход подписки.
+        self._seen: OrderedDict[int, None] = OrderedDict()
+
+    def _is_duplicate(self, message_id: int) -> bool:
+        if message_id <= 0:
+            return False
+        if message_id in self._seen:
+            return True
+        self._seen[message_id] = None
+        while len(self._seen) > SEEN_MESSAGES_LIMIT:
+            self._seen.popitem(last=False)
+        return False
 
     def _spawn(self, coro: Any) -> None:
         task = asyncio.create_task(coro)
@@ -258,8 +291,18 @@ class Bot:
         if from_id <= 0:
             # Сообщение от самого сообщества — эхо собственных ответов.
             return
+        if peer_id >= CHAT_PEER_BASE:
+            # Беседа. Бот личный: в общем чате он отвечал бы на каждую реплику
+            # любого, кто попал в белый список, и жёг бы подписку.
+            log.info("Игнорирую сообщение из беседы %s", peer_id)
+            return
         if from_id not in self.config.allowed_user_ids:
             log.info("Игнорирую сообщение от %s (нет в ALLOWED_USER_IDS)", from_id)
+            return
+
+        message_id = int(message.get("id", 0))
+        if self._is_duplicate(message_id):
+            log.info("Повтор сообщения %s — пропускаю", message_id)
             return
 
         text = (message.get("text") or "").strip()
@@ -270,7 +313,7 @@ class Bot:
 
         job = Job(
             text=text,
-            message_id=int(message.get("id", 0)),
+            message_id=message_id,
             attachments=message.get("attachments") or [],
         )
         if not job.text and not job.attachments:

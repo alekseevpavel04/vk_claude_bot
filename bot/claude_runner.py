@@ -11,18 +11,22 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     CLINotFoundError,
+    PermissionResultAllow,
+    PermissionResultDeny,
     RateLimitEvent,
     RateLimitInfo,
     ResultMessage,
     TextBlock,
+    ToolPermissionContext,
     ToolUseBlock,
     delete_session,
     list_sessions,
@@ -34,6 +38,10 @@ log = logging.getLogger(__name__)
 # Набор инструментов задаётся явно: всего, чего здесь нет, у агента просто не
 # существует. Bash, Write и Edit не входят — бот не должен ничего менять на VPS.
 TOOLS = ["Read", "Glob", "WebSearch", "WebFetch", "TodoWrite"]
+
+# Read спрашивает разрешение у нашего кода на каждый вызов (см. _permission_check):
+# без этого он читает любой файл в контейнере, включая /proc/1/environ с токенами.
+AUTO_ALLOWED_TOOLS = ["Glob", "WebSearch", "WebFetch", "TodoWrite"]
 
 SYSTEM_PROMPT = """\
 Ты — личный ассистент одного человека. Вы переписываетесь ВКонтакте, он читает
@@ -113,6 +121,39 @@ def _log_stderr(line: str) -> None:
         log.warning("claude stderr: %s", line)
 
 
+def _make_permission_check(workspace: Path):
+    """Разрешает Read только внутри рабочей папки.
+
+    Без этой проверки агент может прочитать любой файл контейнера — например
+    /proc/1/environ, где лежат токены ВК и Claude. Достаточно попросить его об
+    этом в переписке или подсунуть такую инструкцию в веб-странице.
+    """
+    root = workspace.resolve()
+
+    async def check(
+        tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if tool_name != "Read":
+            return PermissionResultDeny(message=f"Инструмент {tool_name} боту недоступен.")
+
+        raw = tool_input.get("file_path")
+        if not isinstance(raw, str) or not raw:
+            return PermissionResultDeny(message="Не указан путь к файлу.")
+        try:
+            target = Path(raw).resolve()
+        except (OSError, ValueError):
+            return PermissionResultDeny(message="Некорректный путь.")
+
+        if target != root and root not in target.parents:
+            log.warning("Отклонено чтение вне рабочей папки: %s", target)
+            return PermissionResultDeny(
+                message="Читать можно только файлы, присланные в этой переписке."
+            )
+        return PermissionResultAllow()
+
+    return check
+
+
 def _build_options(
     *,
     cwd: Path,
@@ -130,11 +171,12 @@ def _build_options(
     return ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         tools=TOOLS,
-        allowed_tools=TOOLS,
+        allowed_tools=AUTO_ALLOWED_TOOLS,
         disallowed_tools=["Bash", "Write", "Edit", "NotebookEdit", "Task"],
-        # Всё, чего нет в allowed_tools, отклоняется молча вместо запроса
-        # разрешения — спросить пользователя в переписке всё равно некого.
-        permission_mode="dontAsk",
+        # Read не в allowed_tools, поэтому решение по нему принимает can_use_tool.
+        # Спрашивать человека в переписке нельзя — отвечаем за него из кода.
+        permission_mode="default",
+        can_use_tool=_make_permission_check(cwd),
         setting_sources=[],
         cwd=str(cwd),
         resume=resume,
@@ -143,6 +185,16 @@ def _build_options(
         env=env,
         stderr=_log_stderr,
     )
+
+
+async def _as_stream(text: str) -> AsyncIterator[dict[str, Any]]:
+    """Один вопрос, поданный потоком.
+
+    can_use_tool работает только в streaming-режиме: со строковым промптом SDK
+    отказывается запускаться. Отдаём ровно одно сообщение и закрываем поток —
+    для обычного вопроса этого достаточно.
+    """
+    yield {"type": "user", "message": {"role": "user", "content": text}}
 
 
 async def run_turn(
@@ -166,7 +218,7 @@ async def run_turn(
     limits: dict[str, RateLimitInfo] = {}
 
     try:
-        async for message in query(prompt=prompt, options=options):
+        async for message in query(prompt=_as_stream(prompt), options=options):
             if isinstance(message, RateLimitEvent):
                 info = message.rate_limit_info
                 limits[info.rate_limit_type or "unknown"] = info
@@ -241,8 +293,12 @@ def _human_delay(seconds: float) -> str:
     return f"{days} дн {hours} ч" if hours else f"{days} дн"
 
 
-# Пороги, на которых бот сам предупреждает о расходе лимита.
+# Пороги расхода в процентах. Работают, только если API пришлёт utilization —
+# сейчас он приходит пустым, и живых сигналов ровно два: status allowed_warning
+# (подходим к лимиту) и rejected (исчерпан). Им соответствуют отметки 90 и 100.
 LIMIT_THRESHOLDS = (25, 50, 75, 90, 100)
+WARNING_MARK = 90
+EXHAUSTED_MARK = 100
 
 
 def utilization_percent(info: RateLimitInfo) -> float | None:
@@ -275,12 +331,15 @@ def threshold_alerts(
         name = _LIMIT_NAMES.get(kind, kind)
         percent = utilization_percent(info)
 
-        if info.status == "rejected":
-            reached = 100
-        elif percent is None:
-            continue
-        else:
-            reached = max((step for step in LIMIT_THRESHOLDS if percent >= step), default=0)
+        by_percent = (
+            max((step for step in LIMIT_THRESHOLDS if percent >= step), default=0)
+            if percent is not None
+            else 0
+        )
+        by_status = {"rejected": EXHAUSTED_MARK, "allowed_warning": WARNING_MARK}.get(
+            info.status, 0
+        )
+        reached = max(by_percent, by_status)
 
         previous = updated.get(kind, 0)
         if reached == previous:
@@ -289,12 +348,14 @@ def threshold_alerts(
         if reached < previous:
             continue  # окно обнулилось — молча снимаем отметку
 
-        if reached >= 100:
+        if reached >= EXHAUSTED_MARK:
             alerts.append(f"Лимит подписки Claude исчерпан ({name}).{_reset_note(info)}")
-        else:
+        elif percent is not None:
             alerts.append(
                 f"Израсходовано {reached}% лимита подписки Claude ({name}).{_reset_note(info)}"
             )
+        else:
+            alerts.append(f"Подписка Claude подходит к лимиту ({name}).{_reset_note(info)}")
 
     return alerts, updated
 
@@ -311,23 +372,27 @@ def describe_limits(limits: dict[str, RateLimitInfo]) -> str:
     for kind, info in sorted(limits.items()):
         name = _LIMIT_NAMES.get(kind, kind)
         parts: list[str] = []
-        if info.utilization is not None:
-            # API отдаёт долю в диапазоне 0..1 либо сразу проценты.
-            percent = info.utilization * 100 if info.utilization <= 1 else info.utilization
+        percent = utilization_percent(info)
+        if percent is not None:
             parts.append(f"потрачено {percent:.0f}%")
+        if info.status == "rejected":
+            parts.append("ИСЧЕРПАН")
+        elif info.status == "allowed_warning":
+            parts.append("близко к пределу")
+        elif percent is None:
+            parts.append("расход в норме")
         if info.resets_at:
             left = info.resets_at - now
             parts.append(f"обнулится через {_human_delay(left)}" if left > 0 else "уже обнулился")
-        if info.status == "rejected":
-            parts.append("ЛИМИТ ИСЧЕРПАН")
-        elif info.status == "allowed_warning":
-            parts.append("близко к пределу")
         lines.append(f"— {name}: {', '.join(parts)}" if parts else f"— {name}: данных нет")
 
     text = "Лимиты подписки Claude:\n" + "\n".join(lines)
     if all(info.utilization is None for info in limits.values()):
-        # Процент расхода API присылает только когда он становится заметным.
-        text += "\nПроцент расхода не показывают — значит, до потолка ещё далеко."
+        # Точный процент приходит не всегда — у API для этого канала его просто нет.
+        text += (
+            "\nТочный процент Claude здесь не сообщает — только состояние. "
+            "Предупрежу сам, когда подписка подойдёт к лимиту."
+        )
     return text
 
 
