@@ -20,13 +20,11 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     CLINotFoundError,
-    PermissionResultAllow,
-    PermissionResultDeny,
+    HookMatcher,
     RateLimitEvent,
     RateLimitInfo,
     ResultMessage,
     TextBlock,
-    ToolPermissionContext,
     ToolUseBlock,
     delete_session,
     list_sessions,
@@ -38,10 +36,6 @@ log = logging.getLogger(__name__)
 # Набор инструментов задаётся явно: всего, чего здесь нет, у агента просто не
 # существует. Bash, Write и Edit не входят — бот не должен ничего менять на VPS.
 TOOLS = ["Read", "Glob", "WebSearch", "WebFetch", "TodoWrite"]
-
-# Read спрашивает разрешение у нашего кода на каждый вызов (см. _permission_check):
-# без этого он читает любой файл в контейнере, включая /proc/1/environ с токенами.
-AUTO_ALLOWED_TOOLS = ["Glob", "WebSearch", "WebFetch", "TodoWrite"]
 
 SYSTEM_PROMPT = """\
 Ты — личный ассистент одного человека. Вы переписываетесь ВКонтакте, он читает
@@ -122,37 +116,51 @@ def _log_stderr(line: str) -> None:
         log.warning("claude stderr: %s", line)
 
 
-def _make_permission_check(workspace: Path):
-    """Разрешает Read только внутри рабочей папки.
+def _make_read_guard(workspace: Path):
+    """Хук, пропускающий Read только внутри рабочей папки.
 
-    Без этой проверки агент может прочитать любой файл контейнера — например
-    /proc/1/environ, где лежат токены ВК и Claude. Достаточно попросить его об
-    этом в переписке или подсунуть такую инструкцию в веб-странице.
+    Именно хук, а не can_use_tool: тот вызывается лишь для инструментов, по
+    которым CLI сам не принял решение, а Read он авторазрешает как безопасный —
+    callback до нас просто не доходит (проверено на живом сервере).
+
+    У Claude Code есть и своё ограничение рабочей директорией, но полагаться
+    только на него нельзя: это чужая настройка по умолчанию, которая может
+    измениться с версией CLI, а цена промаха — токены ВК и Claude из
+    /proc/1/environ, выданные в переписку по первой просьбе.
     """
     root = workspace.resolve()
 
-    async def check(
-        tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
-    ) -> PermissionResultAllow | PermissionResultDeny:
-        if tool_name != "Read":
-            return PermissionResultDeny(message=f"Инструмент {tool_name} боту недоступен.")
+    async def guard(
+        input_data: dict[str, Any], tool_use_id: str | None, context: Any
+    ) -> dict[str, Any]:
+        if input_data.get("tool_name") != "Read":
+            return {}
 
-        raw = tool_input.get("file_path")
+        raw = (input_data.get("tool_input") or {}).get("file_path")
+        verdict: str | None = None
         if not isinstance(raw, str) or not raw:
-            return PermissionResultDeny(message="Не указан путь к файлу.")
-        try:
-            target = Path(raw).resolve()
-        except (OSError, ValueError):
-            return PermissionResultDeny(message="Некорректный путь.")
+            verdict = "Не указан путь к файлу."
+        else:
+            try:
+                target = Path(raw).resolve()
+            except (OSError, ValueError):
+                verdict = "Некорректный путь."
+            else:
+                if target != root and root not in target.parents:
+                    log.warning("Отклонено чтение вне рабочей папки: %s", target)
+                    verdict = "Читать можно только файлы, присланные в этой переписке."
 
-        if target != root and root not in target.parents:
-            log.warning("Отклонено чтение вне рабочей папки: %s", target)
-            return PermissionResultDeny(
-                message="Читать можно только файлы, присланные в этой переписке."
-            )
-        return PermissionResultAllow()
+        if verdict is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": verdict,
+            }
+        }
 
-    return check
+    return guard
 
 
 def _build_options(
@@ -172,12 +180,12 @@ def _build_options(
     return ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         tools=TOOLS,
-        allowed_tools=AUTO_ALLOWED_TOOLS,
+        allowed_tools=TOOLS,
         disallowed_tools=["Bash", "Write", "Edit", "NotebookEdit", "Task"],
-        # Read не в allowed_tools, поэтому решение по нему принимает can_use_tool.
-        # Спрашивать человека в переписке нельзя — отвечаем за него из кода.
-        permission_mode="default",
-        can_use_tool=_make_permission_check(cwd),
+        # Всё, чего нет в tools, отклоняется молча: спрашивать человека в
+        # переписке всё равно некого. Пути для Read проверяет хук ниже.
+        permission_mode="dontAsk",
+        hooks={"PreToolUse": [HookMatcher(matcher="Read", hooks=[_make_read_guard(cwd)])]},
         setting_sources=[],
         cwd=str(cwd),
         resume=resume,
