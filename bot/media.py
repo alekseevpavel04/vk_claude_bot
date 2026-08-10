@@ -27,7 +27,9 @@ READABLE_EXTENSIONS = {
     "py", "js", "ts", "html", "css", "sh", "sql",
 }
 
-_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+# Кириллицу оставляем: имя файла из ВК иначе превращается в ряд подчёркиваний,
+# и в чате видно «Смотрю: 20260810-152037-9-0-____________.txt».
+_UNSAFE = re.compile(r"[^\w.-]", re.UNICODE)
 
 
 @dataclass(frozen=True)

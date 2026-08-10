@@ -54,7 +54,9 @@ class VkClient:
                 async with self._session.post(API_URL + method, data=payload) as response:
                     data = await response.json(content_type=None)
                 break
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # ValueError — ответ не разобрался как JSON: так выглядит заглушка
+            # прокси или страница ошибки вместо ответа API.
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
                 last_exc = exc
                 delay = 2**attempt
                 log.warning("Сеть при вызове %s (%s), повтор через %ss", method, exc, delay)

@@ -108,6 +108,7 @@ def describe_tool(block: ToolUseBlock) -> str | None:
     if not isinstance(value, str) or not value:
         return label
     if argument == "file_path":
+        # В чате полезно имя файла, а не путь вида /app/workspace/media/145.../…
         value = Path(value).name
     if len(value) > 120:
         value = value[:117] + "..."
@@ -405,6 +406,10 @@ async def probe_rate_limits(*, cwd: Path, model: str | None) -> dict[str, RateLi
         model=model,
         max_turns=1,
     )
+    # Убираем за собой: иначе каждый /limits оставлял бы на диске транскрипт
+    # разговора из одной реплики.
+    if result.session_id:
+        await forget_sessions(cwd, [result.session_id])
     return result.rate_limits
 
 

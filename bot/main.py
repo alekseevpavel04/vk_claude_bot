@@ -55,6 +55,16 @@ CHAT_PEER_BASE = 2_000_000_000
 # Сколько id обработанных сообщений помнить ради защиты от повторов.
 SEEN_MESSAGES_LIMIT = 500
 
+# Сколько вопросов может ждать своей очереди у одного собеседника.
+QUEUE_LIMIT = 5
+
+# Потолок на один ход. Без него зависший агент держал бы собеседника вечно:
+# бот молчит, очередь стоит, и понять это можно только по /status.
+TURN_TIMEOUT = 900
+
+# Задержка между частями длинного ответа — против флуд-контроля ВК.
+CHUNK_PAUSE = 0.35
+
 STOP_CONFIRM_REPLY = """\
 Точно выключить? Я остановлюсь целиком и сам обратно не поднимусь — ни после
 перезапуска контейнера, ни после перезагрузки сервера.
@@ -91,8 +101,12 @@ class PeerWorker:
         if self._loop_task is None:
             self._loop_task = asyncio.create_task(self._run(), name=f"peer-{self.peer_id}")
 
-    def submit(self, job: Job) -> None:
+    def submit(self, job: Job) -> bool:
+        """Ставит вопрос в очередь. False — очередь переполнена."""
+        if self._queue.qsize() >= QUEUE_LIMIT:
+            return False
         self._queue.put_nowait(job)
+        return True
 
     @property
     def queued(self) -> int:
@@ -166,14 +180,26 @@ class PeerWorker:
                 bot.sessions.reset(self.peer_id)
                 stored = None
 
-            result = await claude_runner.run_turn(
-                prompt=prompt,
-                cwd=bot.config.workspace,
-                resume=stored.session_id if stored else None,
-                model=bot.config.claude_model,
-                max_turns=bot.config.max_turns,
-                on_tool=progress.report if bot.config.show_tool_progress else None,
-            )
+            try:
+                result = await asyncio.wait_for(
+                    claude_runner.run_turn(
+                        prompt=prompt,
+                        cwd=bot.config.workspace,
+                        resume=stored.session_id if stored else None,
+                        model=bot.config.claude_model,
+                        max_turns=bot.config.max_turns,
+                        on_tool=progress.report if bot.config.show_tool_progress else None,
+                    ),
+                    timeout=TURN_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.warning("Ход для %s не уложился в %s с — прерываю", self.peer_id, TURN_TIMEOUT)
+                await self._say(
+                    self.peer_id,
+                    f"Не уложился в {TURN_TIMEOUT // 60} минут и прервался. "
+                    "Попробуй сузить вопрос или начать заново: /new",
+                )
+                return
 
             if result.session_id:
                 bot.sessions.remember(self.peer_id, result.session_id)
@@ -268,7 +294,11 @@ class Bot:
 
     async def reply(self, peer_id: int, text: str) -> None:
         chunks = formatting.prepare(text)
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
+            # Пауза между частями: ВК срабатывает флуд-контролем на очередь
+            # сообщений подряд и может отбить длинный ответ целиком.
+            if index:
+                await asyncio.sleep(CHUNK_PAUSE)
             await self.vk.send_message(peer_id, chunk)
 
     async def keep_typing(self, peer_id: int) -> None:
@@ -320,9 +350,17 @@ class Bot:
             return
 
         worker = self._worker(peer_id)
-        if worker.busy:
+        if not worker.submit(job):
+            await self.reply(
+                peer_id,
+                f"Больше {QUEUE_LIMIT} вопросов в очередь не приму — сначала разберусь "
+                "с этими. Прервать текущий: /cancel",
+            )
+            return
+        # Сообщаем об ожидании только на первом отложенном вопросе: иначе на
+        # каждое следующее сообщение прилетал бы одинаковый ответ.
+        if worker.busy and worker.queued == 1:
             await self.reply(peer_id, "Занят предыдущим вопросом — отвечу на этот следом.")
-        worker.submit(job)
 
     def _worker(self, peer_id: int) -> PeerWorker:
         worker = self._workers.get(peer_id)
@@ -423,6 +461,20 @@ class Bot:
 
     async def _limits_report(self, peer_id: int) -> None:
         fresh = self._limits and time.monotonic() - self._limits_at < 120
+
+        if not fresh and any(worker.busy for worker in self._workers.values()):
+            # Узнать лимиты можно только запросом к Claude, а это второй процесс
+            # рядом с работающим. На сервере с гигабайтом памяти это верный OOM.
+            if self._limits:
+                await self.reply(
+                    peer_id,
+                    claude_runner.describe_limits(self._limits)
+                    + "\n\nЭто данные с прошлого ответа — сейчас я занят вопросом.",
+                )
+            else:
+                await self.reply(peer_id, "Сейчас занят вопросом, спроси лимиты после ответа.")
+            return
+
         if not fresh:
             with contextlib.suppress(Exception):
                 await self.vk.set_activity(peer_id)
@@ -449,11 +501,13 @@ class Bot:
             lines.append(f"В очереди ещё сообщений: {worker.queued}.")
         if stored:
             age = stored.age_hours()
-            left = max(0.0, self.config.session_ttl_hours - age)
-            lines.append(
-                f"Контекст: {stored.turns} ход(ов), последний {age:.0f} ч назад. "
-                f"Сам обнулится через {left / 24:.0f} дн."
-            )
+            line = f"Контекст: {stored.turns} ход(ов), последний {age:.0f} ч назад."
+            if self.config.session_ttl_hours > 0:
+                left = max(0.0, self.config.session_ttl_hours - age)
+                line += f" Сам обнулится через {left / 24:.0f} дн."
+            else:
+                line += " Сам не обнуляется."
+            lines.append(line)
         else:
             lines.append("Контекст пустой.")
         return "\n".join(lines)
