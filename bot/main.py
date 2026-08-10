@@ -280,7 +280,17 @@ class Bot:
     def _spawn(self, coro: Any) -> None:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_finished)
+
+    def _task_finished(self, task: asyncio.Task[None]) -> None:
+        """Иначе исключение фоновой задачи пропадает совсем: Python сообщит о
+        нём только при сборке мусора, и то в поток ошибок без контекста."""
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error("Фоновая задача упала", exc_info=error)
 
     def remember_limits(self, limits: dict[str, Any]) -> list[str]:
         """Запоминает состояние лимитов и отдаёт предупреждения о новых порогах."""
@@ -388,7 +398,14 @@ class Bot:
             worker = self._workers.get(peer_id)
             if worker is not None:
                 worker.cancel_current()
+            stored = self.sessions.get(peer_id)
             had = self.sessions.reset(peer_id)
+            if stored is not None:
+                # Забыть разговор и оставить его транскрипт на диске — верный
+                # способ незаметно засорить сервер.
+                self._spawn(
+                    claude_runner.forget_sessions(self.config.workspace, [stored.session_id])
+                )
             await self.reply(
                 peer_id,
                 "Контекст сброшен, начинаем заново." if had else "Контекста и так не было. Спрашивай.",
@@ -608,6 +625,14 @@ async def _prune_sessions(bot: Bot) -> None:
     stale = bot.sessions.prune(bot.config.session_ttl_hours)
     if stale:
         await claude_runner.forget_sessions(bot.config.workspace, stale)
+    # Плюс всё, что осталось на диске само по себе: транскрипты от /new,
+    # от проверок настройки и от прежних запусков бота. Активные разговоры
+    # передаём отдельно — их не трогаем, каким бы ни был возраст файла.
+    await claude_runner.forget_stale_sessions(
+        bot.config.workspace,
+        bot.config.session_ttl_hours,
+        keep=set(bot.sessions.session_ids()),
+    )
 
 
 async def _prune_loop(bot: Bot, interval_seconds: int = 3600) -> None:

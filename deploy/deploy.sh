@@ -23,6 +23,9 @@ CONFIG="$SCRIPT_DIR/deploy.env"
 # Должен совпадать с uid пользователя bot из Dockerfile.
 CONTAINER_UID=10001
 
+# Сколько места разрешено кэшу сборок Docker на сервере.
+BUILD_CACHE_LIMIT=1GB
+
 die() { printf '\nОшибка: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n=== %s\n' "$*"; }
 # Справка = шапка этого файла: печатаем комментарии до первой строки кода.
@@ -126,6 +129,29 @@ clear_kill_flag() {
     remote "${SUDO}rm -f '$REMOTE_DIR/workspace/.killed'"
 }
 
+tidy_docker() {
+    # Каждая пересборка оставляет слои в кэше BuildKit и предыдущий образ
+    # висячим. За десяток деплоев это гигабайты на диске, и никто их не чистит.
+    # Кэш не сносим полностью — с ним следующая сборка занимает секунды,
+    # а не минуты; держим в пределах BUILD_CACHE_LIMIT.
+    step "Убираю за сборкой"
+    remote "${SUDO}docker image prune -f >/dev/null 2>&1 || true"
+    remote "${SUDO}docker builder prune -f --max-used-space $BUILD_CACHE_LIMIT >/dev/null 2>&1 || true"
+    remote "${SUDO}docker system df | awk 'NR==1 || /Images|Build Cache/ {print \"  \" \$0}'"
+
+    # Проверяем, что бот действительно работает на свежесобранном образе.
+    local running built
+    running=$(remote "${SUDO}docker inspect -f '{{.Image}}' vk-claude-bot 2>/dev/null" || true)
+    built=$(remote "${SUDO}docker inspect -f '{{.Id}}' vk-claude-bot-bot:latest 2>/dev/null" || true)
+    if [[ -n "$running" && -n "$built" && "$running" != "$built" ]]; then
+        printf '\nВНИМАНИЕ: контейнер работает не на свежем образе.\n' >&2
+        printf '  контейнер: %s\n  собран:    %s\n' "$running" "$built" >&2
+        printf 'Выполни: ./deploy/deploy.sh update\n' >&2
+    else
+        echo "  образ контейнера совпадает со свежесобранным"
+    fi
+}
+
 cmd_install() {
     check_env
     check_ssh
@@ -133,7 +159,10 @@ cmd_install() {
     sync_code
     step "Собираю образ и запускаю (первый раз это несколько минут)"
     clear_kill_flag
-    compose "up -d --build"
+    # --force-recreate обязателен: без него compose иногда оставляет старый
+    # контейнер на новом образе, и деплой рапортует об успехе, не применив код.
+    compose "up -d --build --force-recreate"
+    tidy_docker
     cmd_status
     printf '\nГотово. Живой лог: ./deploy/deploy.sh logs\n'
 }
@@ -143,7 +172,10 @@ cmd_update() {
     check_ssh
     sync_code
     step "Пересобираю и перезапускаю"
-    compose "up -d --build"
+    # --force-recreate обязателен: без него compose иногда оставляет старый
+    # контейнер на новом образе, и деплой рапортует об успехе, не применив код.
+    compose "up -d --build --force-recreate"
+    tidy_docker
     cmd_status
 }
 

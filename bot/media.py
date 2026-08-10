@@ -193,7 +193,8 @@ class MediaStore:
         if stem:
             base = _UNSAFE.sub("_", Path(stem).stem)[:40] or "file"
         else:
-            base = default_ext
+            # Без этого имя выходило вида «…-0-0-jpg.jpg» — расширение дважды.
+            base = "photo"
         path = target_dir / f"{stamp}-{message_id}-{index}-{base}.{default_ext}"
 
         # Любой сбой посреди загрузки не должен оставлять обрезанный файл: Claude

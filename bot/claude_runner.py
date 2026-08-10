@@ -40,6 +40,10 @@ log = logging.getLogger(__name__)
 # существует. Bash, Write и Edit не входят — бот не должен ничего менять на VPS.
 TOOLS = ["Read", "Glob", "WebSearch", "WebFetch", "TodoWrite"]
 
+# Потолок JSON-сообщения между SDK и CLI. Файл едет в base64 (+33% к размеру),
+# поэтому берём с запасом над MAX_ATTACHMENT_MB (20 МБ по умолчанию).
+MAX_BUFFER_BYTES = 48 * 1024 * 1024
+
 SYSTEM_PROMPT = """\
 Ты — личный ассистент одного человека. Вы переписываетесь ВКонтакте, он читает
 тебя с телефона.
@@ -183,6 +187,24 @@ def _make_tool_guard(workspace: Path):
                         log.warning("Отклонено чтение вне рабочей папки: %s", target)
                         verdict = "Читать можно только файлы, присланные в этой переписке."
 
+        elif tool_name == "Glob":
+            # Сам по себе Glob ничего не читает, но абсолютным шаблоном можно
+            # осмотреть файловую систему сервера — этого агенту тоже не нужно.
+            for key in ("path", "pattern"):
+                value = tool_input.get(key)
+                if not isinstance(value, str) or not value.startswith("/"):
+                    continue
+                base = Path(value.split("*", 1)[0])
+                try:
+                    target = base.resolve()
+                except (OSError, ValueError):
+                    verdict = "Некорректный путь."
+                    break
+                if target != root and root not in target.parents:
+                    log.warning("Отклонён поиск файлов вне рабочей папки: %s", value)
+                    verdict = "Искать можно только в рабочей папке."
+                    break
+
         elif tool_name == "WebFetch":
             # Контейнер видит внутреннюю сеть сервера: метаданные облака,
             # соседние сервисы на хосте. WebFetch — единственный инструмент,
@@ -236,6 +258,11 @@ def _build_options(
         model=model,
         env=env,
         stderr=_log_stderr,
+        # SDK и CLI общаются одним JSON-сообщением на событие, а содержимое
+        # прочитанного файла едет внутри него. Буфер по умолчанию — 1 МБ, то
+        # есть любое фото с телефона роняет ход с «JSON message exceeded
+        # maximum buffer size». Держим запас над лимитом на вложение.
+        max_buffer_size=MAX_BUFFER_BYTES,
     )
 
 
@@ -489,6 +516,52 @@ def _forget_blocking(cwd: Path, session_ids: list[str] | None) -> int:
 async def forget_sessions(cwd: Path, session_ids: list[str] | None = None) -> int:
     """Стирает транскрипты разговоров с диска. None — стереть все в этой папке."""
     return await asyncio.to_thread(_forget_blocking, cwd, session_ids)
+
+
+def _forget_stale_blocking(cwd: Path, max_age_hours: int, keep: frozenset[str]) -> int:
+    directory = str(cwd)
+    try:
+        sessions = list_sessions(directory=directory)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Не удалось перечислить сессии Claude: %s", exc)
+        return 0
+
+    cutoff = time.time() - max_age_hours * 3600
+    stale: list[str] = []
+    for info in sessions:
+        # Разговоры, которые бот ещё помнит, не трогаем ни при каком возрасте:
+        # удалить транскрипт под активной сессией — значит уронить следующий
+        # resume, а это как раз та поломка, которую мы уже однажды ловили.
+        if info.session_id in keep:
+            continue
+        stamp = info.last_modified
+        if stamp is None:
+            continue
+        # SDK отдаёт миллисекунды; страхуемся, если однажды станут секундами.
+        seconds = stamp / 1000 if stamp > 1e12 else stamp
+        if seconds < cutoff:
+            stale.append(info.session_id)
+
+    return _forget_blocking(cwd, stale) if stale else 0
+
+
+async def forget_stale_sessions(
+    cwd: Path, max_age_hours: int, keep: set[str] | frozenset[str] | None = None
+) -> int:
+    """Убирает транскрипты, к которым давно не обращались.
+
+    Нужна отдельно от prune по state.json: тот знает только про разговоры,
+    которые бот ещё помнит. Транскрипты от /new, от проверок и от прежних
+    запусков не значатся нигде и иначе остаются на диске навсегда.
+    """
+    if max_age_hours <= 0:
+        return 0
+    removed = await asyncio.to_thread(
+        _forget_stale_blocking, cwd, max_age_hours, frozenset(keep or ())
+    )
+    if removed:
+        log.info("Удалено забытых транскриптов: %s", removed)
+    return removed
 
 
 def _explain_error(kind: str) -> str:
