@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import signal
 import time
 from collections import OrderedDict
@@ -63,6 +64,13 @@ QUEUE_LIMIT = 5
 # бот молчит, очередь стоит, и понять это можно только по /status.
 TURN_TIMEOUT = 900
 
+# Потолок на скачивание всех вложений одного сообщения.
+MEDIA_TIMEOUT = 180
+
+# Потолок ожидания продолжения (само окно — MESSAGE_MERGE_SECONDS в .env):
+# поток сообщений не должен откладывать ответ бесконечно.
+COALESCE_MAX = 15.0
+
 # Задержка между частями длинного ответа — против флуд-контроля ВК.
 CHUNK_PAUSE = 0.35
 
@@ -78,6 +86,10 @@ STOP_REPLY = """\
 """
 
 CLEAR_INTRO = "Чищу всё: разговоры и файлы…"
+
+# Команда — это слэш и одно слово. Всё остальное («/usr/bin/env — что это?»)
+# отправляется Claude как обычный вопрос.
+_COMMAND = re.compile(r"^/([^\W\d_][\w-]*)$", re.UNICODE)
 
 
 @dataclass
@@ -132,23 +144,55 @@ class PeerWorker:
 
     async def _run(self) -> None:
         while True:
-            job = await self._queue.get()
-            self._turn_task = asyncio.create_task(self._handle(job))
-            self.busy_since = time.monotonic()
+            jobs = [await self._queue.get()]
+            # «Печатает» включаем сразу, ещё на паузе: иначе после отправки
+            # сообщения несколько секунд не происходит вообще ничего.
+            typing = asyncio.create_task(self._bot.keep_typing(self.peer_id))
             try:
-                await self._turn_task
-            except asyncio.CancelledError:
-                # Отменён именно ход (командой /stop), а не весь воркер.
-                if self._loop_task is not None and self._loop_task.cancelling():
-                    raise
-                await self._say(self.peer_id, "Остановил. Что дальше?")
-            except Exception as exc:  # noqa: BLE001 — воркер должен пережить любой сбой
-                log.exception("Ошибка при обработке сообщения от %s", self.peer_id)
-                await self._say(self.peer_id, f"Что-то сломалось: {exc}")
+                await self._gather(jobs)
+                self._turn_task = asyncio.create_task(self._handle(jobs))
+                self.busy_since = time.monotonic()
+                try:
+                    await self._turn_task
+                except asyncio.CancelledError:
+                    # Отменён именно ход (командой /stop), а не весь воркер.
+                    if self._loop_task is not None and self._loop_task.cancelling():
+                        raise
+                    await self._say(self.peer_id, "Остановил. Что дальше?")
+                except Exception as exc:  # noqa: BLE001 — воркер переживает любой сбой
+                    log.exception("Ошибка при обработке сообщения от %s", self.peer_id)
+                    await self._say(self.peer_id, f"Что-то сломалось: {exc}")
             finally:
+                typing.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await typing
                 self._turn_task = None
                 self.busy_since = None
-                self._queue.task_done()
+                for _ in jobs:
+                    self._queue.task_done()
+
+    async def _gather(self, jobs: list[Job]) -> None:
+        """Добирает сообщения, пришедшие сразу следом, чтобы ответить разом.
+
+        Переслав что-то с телефона, человек тут же дописывает комментарий — ВК
+        шлёт это двумя сообщениями подряд, и без паузы бот отвечал бы на репост
+        и на комментарий порознь, не связав их. Отсчёт идёт от последнего
+        сообщения, поэтому вопрос, набранный в три захода, тоже соберётся в один.
+        """
+        window = self._bot.config.merge_window_seconds
+        if window <= 0:
+            return
+        deadline = time.monotonic() + COALESCE_MAX
+        while True:
+            left = min(window, deadline - time.monotonic())
+            if left <= 0:
+                break
+            try:
+                jobs.append(await asyncio.wait_for(self._queue.get(), timeout=left))
+            except asyncio.TimeoutError:
+                break
+        if len(jobs) > 1:
+            log.info("Сообщений собрано в один вопрос: %s", len(jobs))
 
     async def _say(self, peer_id: int, text: str) -> None:
         """Отправка, которая не может убить воркер.
@@ -163,59 +207,72 @@ class PeerWorker:
         except Exception:  # noqa: BLE001
             log.exception("Не удалось отправить сообщение в %s", peer_id)
 
-    async def _handle(self, job: Job) -> None:
+    async def _handle(self, jobs: list[Job]) -> None:
         bot = self._bot
-        typing = asyncio.create_task(bot.keep_typing(self.peer_id))
         progress = _ProgressReporter(bot, self.peer_id)
+
+        # Скачивание — тоже под таймаутом, и отдельно от хода: оно идёт до него,
+        # а сервер, отдающий файл по байту в минуту, держал бы соединение живым
+        # сколько угодно (sock_read так и не сработает).
         try:
-            parts = await bot.media.collect_parts(self.peer_id, job.message_id, job.message)
-            prompt = _build_prompt(parts)
+            messages = await asyncio.wait_for(self._collect(jobs), timeout=MEDIA_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("Вложения от %s не скачались за %s с", self.peer_id, MEDIA_TIMEOUT)
+            await self._say(self.peer_id, "Не смог скачать вложения — ВК не отдаёт файлы.")
+            return
+        prompt = _build_prompt(messages)
 
-            stored = bot.sessions.get(self.peer_id)
-            if stored is not None and stored.age_hours() > bot.config.session_ttl_hours:
-                log.info(
-                    "Разговор с %s не обновлялся %.0f ч — начинаю с чистого листа",
-                    self.peer_id,
-                    stored.age_hours(),
-                )
-                await claude_runner.forget_sessions(bot.config.workspace, [stored.session_id])
-                bot.sessions.reset(self.peer_id)
-                stored = None
+        stored = bot.sessions.get(self.peer_id)
+        if stored is not None and stored.age_hours() > bot.config.session_ttl_hours:
+            log.info(
+                "Разговор с %s не обновлялся %.0f ч — начинаю с чистого листа",
+                self.peer_id,
+                stored.age_hours(),
+            )
+            await claude_runner.forget_sessions(bot.config.workspace, [stored.session_id])
+            bot.sessions.reset(self.peer_id)
+            stored = None
 
-            try:
-                result = await asyncio.wait_for(
-                    claude_runner.run_turn(
-                        prompt=prompt,
-                        cwd=bot.config.workspace,
-                        resume=stored.session_id if stored else None,
-                        model=bot.config.claude_model,
-                        max_turns=bot.config.max_turns,
-                        on_tool=progress.report if bot.config.show_tool_progress else None,
-                    ),
-                    timeout=TURN_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                log.warning("Ход для %s не уложился в %s с — прерываю", self.peer_id, TURN_TIMEOUT)
-                await self._say(
-                    self.peer_id,
-                    f"Не уложился в {TURN_TIMEOUT // 60} минут и прервался. "
-                    "Попробуй сузить вопрос или начать заново: /new",
-                )
-                return
+        try:
+            result = await asyncio.wait_for(
+                claude_runner.run_turn(
+                    prompt=prompt,
+                    cwd=bot.config.workspace,
+                    resume=stored.session_id if stored else None,
+                    model=bot.config.claude_model,
+                    max_turns=bot.config.max_turns,
+                    on_tool=progress.report if bot.config.show_tool_progress else None,
+                ),
+                timeout=TURN_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("Ход для %s не уложился в %s с — прерываю", self.peer_id, TURN_TIMEOUT)
+            await self._say(
+                self.peer_id,
+                f"Не уложился в {TURN_TIMEOUT // 60} минут и прервался. "
+                "Попробуй сузить вопрос или начать заново: /new",
+            )
+            return
 
-            if result.session_id:
-                bot.sessions.remember(self.peer_id, result.session_id)
-            alerts = bot.remember_limits(result.rate_limits)
+        if result.session_id:
+            bot.sessions.remember(self.peer_id, result.session_id)
+        alerts = bot.remember_limits(result.rate_limits)
 
-            await bot.reply(self.peer_id, result.text)
-            for alert in alerts:
-                await bot.reply(self.peer_id, alert)
-            if result.cost_usd:
-                log.info("Ход для %s стоил $%.4f", self.peer_id, result.cost_usd)
-        finally:
-            typing.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await typing
+        await bot.reply(self.peer_id, result.text)
+        for alert in alerts:
+            await bot.reply(self.peer_id, alert)
+        if result.cost_usd:
+            log.info("Ход для %s стоил $%.4f", self.peer_id, result.cost_usd)
+
+    async def _collect(self, jobs: list[Job]) -> list[list[MessagePart]]:
+        """Разбирает все собранные сообщения, деля один бюджет на вложения."""
+        budget = self._bot.media.new_budget()
+        return [
+            await self._bot.media.collect_parts(
+                self.peer_id, job.message_id, job.message, budget=budget
+            )
+            for job in jobs
+        ]
 
 
 class _ProgressReporter:
@@ -256,8 +313,12 @@ class Bot:
         # True, если выключение запрошено командой /stop, а не сигналом ОС.
         self.killed = False
         self._workers: dict[int, PeerWorker] = {}
-        # Когда был первый /stop — второй в течение окна подтверждает выключение.
-        self._stop_asked_at: float | None = None
+        # Когда был первый /stop, по собеседникам: второй в течение окна
+        # подтверждает выключение. Именно по собеседникам — иначе «да» одного
+        # человека засчиталось бы как ответ на вопрос, заданный другому.
+        self._stop_asked_at: dict[int, float] = {}
+        # Команды, которые уже выполняются: второй такой же запускать нельзя.
+        self._running: set[str] = set()
         self._limits: dict[str, Any] = {}
         self._limits_at = 0.0
         # Самый высокий порог расхода, о котором уже предупреждали, по видам лимита.
@@ -282,6 +343,27 @@ class Bot:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._task_finished)
+
+    def _spawn_once(self, key: str, coro: Any) -> bool:
+        """Как _spawn, но одновременно выполняется только одна такая команда.
+
+        /limits поднимает рядом ещё один процесс Claude; два сразу — это пик
+        под гигабайт на сервере, где столько всего памяти и рядом живёт чужой
+        сервис. Второй запрос лучше отклонить, чем устроить общий OOM.
+        """
+        if key in self._running:
+            coro.close()  # иначе Python отругается на невыполненную корутину
+            return False
+        self._running.add(key)
+
+        async def guarded() -> None:
+            try:
+                await coro
+            finally:
+                self._running.discard(key)
+
+        self._spawn(guarded())
+        return True
 
     def _task_finished(self, task: asyncio.Task[None]) -> None:
         """Иначе исключение фоновой задачи пропадает совсем: Python сообщит о
@@ -361,6 +443,9 @@ class Bot:
         )
         if not has_content:
             return
+        # Обычный вопрос между двумя /stop снимает запрос подтверждения: иначе
+        # «стоп» спустя минуту разговора неожиданно выключил бы бота.
+        self._stop_asked_at.pop(peer_id, None)
         job = Job(message=message, message_id=message_id)
 
         worker = self._worker(peer_id)
@@ -385,11 +470,17 @@ class Bot:
         return worker
 
     async def _command(self, peer_id: int, text: str) -> bool:
-        command = text.split(maxsplit=1)[0].lower().lstrip("/")
+        match = _COMMAND.match(text.split(maxsplit=1)[0])
+        if match is None:
+            # Сообщение начинается со слэша, но командой не является: путь
+            # /usr/bin/env, дробь, адрес. Такое должно уйти Claude как вопрос,
+            # а не получить в ответ «не знаю команду».
+            return False
+        command = match.group(1).lower()
 
         # Любая команда, кроме повторного /stop, снимает запрос подтверждения.
         if command != "stop":
-            self._stop_asked_at = None
+            self._stop_asked_at.pop(peer_id, None)
 
         if command in {"help", "start", "помощь"}:
             await self.reply(peer_id, HELP_TEXT)
@@ -430,11 +521,13 @@ class Bot:
             return True
 
         if command in {"clear", "очистить"}:
-            self._spawn(self._clear(peer_id))
+            if not self._spawn_once("clear", self._clear(peer_id)):
+                await self.reply(peer_id, "Уже чищу, подожди немного.")
             return True
 
         if command in {"limits", "лимиты"}:
-            self._spawn(self._limits_report(peer_id))
+            if not self._spawn_once("limits", self._limits_report(peer_id)):
+                await self.reply(peer_id, "Уже узнаю лимиты, ответ будет через минуту.")
             return True
 
         if command in {"status", "статус"}:
@@ -446,11 +539,10 @@ class Bot:
 
     async def _stop(self, peer_id: int) -> None:
         now = time.monotonic()
-        confirmed = (
-            self._stop_asked_at is not None and now - self._stop_asked_at <= STOP_CONFIRM_WINDOW
-        )
+        asked_at = self._stop_asked_at.get(peer_id)
+        confirmed = asked_at is not None and now - asked_at <= STOP_CONFIRM_WINDOW
         if not confirmed:
-            self._stop_asked_at = now
+            self._stop_asked_at[peer_id] = now
             await self.reply(peer_id, STOP_CONFIRM_REPLY)
             return
 
@@ -542,31 +634,43 @@ class Bot:
             await worker.close()
 
 
-def _build_prompt(parts: list[MessagePart]) -> str:
+def _build_prompt(messages: list[list[MessagePart]]) -> str:
+    """Один вопрос из всех собранных сообщений.
+
+    Сообщений может быть несколько: переслав что-то с телефона, человек тут же
+    дописывает комментарий, и ВК шлёт это отдельными сообщениями. Для Claude это
+    один вопрос, поэтому свой текст всех сообщений идёт подряд, а пересланное и
+    записи со стены — блоками под ним.
+    """
+    own: list[str] = []
     blocks: list[str] = []
     files: list[str] = []
     notes: list[str] = []
 
-    for index, part in enumerate(parts):
-        if index == 0:
-            blocks.append(part.text or "(сообщение без текста)")
-        elif part.text or part.attachments:
-            header = part.label or "Вложенное сообщение"
-            blocks.append(f"{header}:\n{part.text}" if part.text else f"{header}: без текста")
+    for parts in messages:
+        for index, part in enumerate(parts):
+            if index == 0:
+                if part.text:
+                    own.append(part.text)
+            elif part.text or part.attachments:
+                header = part.label or "Вложенное сообщение"
+                blocks.append(f"{header}:\n{part.text}" if part.text else f"{header}: без текста")
 
-        source = f" (из: {part.label.lower()})" if part.label else ""
-        for item in part.attachments:
-            if item.path is not None:
-                files.append(f"- {item.path}{source}")
-            elif item.note:
-                notes.append(f"- {item.kind}: {item.note}{source}")
+            source = f" (из: {part.label.lower()})" if part.label else ""
+            for item in part.attachments:
+                if item.path is not None:
+                    files.append(f"- {item.path}{source}")
+                elif item.note:
+                    notes.append(f"- {item.kind}: {item.note}{source}")
 
+    out = ["\n".join(own) if own else "(сообщение без текста)"]
+    out.extend(blocks)
     if files:
-        blocks.append("Приложенные файлы (прочитай их инструментом Read):\n" + "\n".join(files))
+        out.append("Приложенные файлы (прочитай их инструментом Read):\n" + "\n".join(files))
     if notes:
-        blocks.append("Прочие вложения:\n" + "\n".join(notes))
+        out.append("Прочие вложения:\n" + "\n".join(notes))
 
-    return "\n\n".join(blocks)
+    return "\n\n".join(out)
 
 
 async def run() -> None:
@@ -590,7 +694,11 @@ async def run() -> None:
     async with make_session(timeout) as http:
         vk = VkClient(http, config.vk_token, config.vk_group_id)
         media = MediaStore(
-            http, config.media_dir, config.max_attachment_bytes, config.media_ttl_days
+            http,
+            config.media_dir,
+            config.max_attachment_bytes,
+            config.media_ttl_days,
+            config.max_media_total_bytes,
         )
         sessions = SessionStore(config.state_file)
 

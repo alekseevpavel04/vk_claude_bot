@@ -11,6 +11,7 @@ import asyncio
 import ipaddress
 import logging
 import os
+import re
 import socket
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -39,6 +40,15 @@ log = logging.getLogger(__name__)
 # Набор инструментов задаётся явно: всего, чего здесь нет, у агента просто не
 # существует. Bash, Write и Edit не входят — бот не должен ничего менять на VPS.
 TOOLS = ["Read", "Glob", "WebSearch", "WebFetch", "TodoWrite"]
+
+# Единственная папка, которую агенту разрешено читать: сюда MediaStore кладёт
+# присланные вложения. Имя должно совпадать с config.media_dir.
+MEDIA_SUBDIR = "media"
+
+# Переменные окружения бота, которым нечего делать в процессе Claude Code.
+# SDK отдаёт подпроцессу всё окружение целиком, а там лежит ключ ВК: чтение
+# /proc и так закрыто хуком, но ключа в чужом процессе быть просто не должно.
+_SECRET_ENV_KEYS = ("VK_TOKEN", "ALLOWED_USER_IDS", "VK_GROUP_ID")
 
 # Потолок JSON-сообщения между SDK и CLI. Файл едет в base64 (+33% к размеру),
 # поэтому берём с запасом над MAX_ATTACHMENT_MB (20 МБ по умолчанию).
@@ -71,9 +81,11 @@ SYSTEM_PROMPT = """\
 Инструменты:
 - WebSearch и WebFetch — когда вопрос про свежие события, цены, курсы, версии,
   документацию, и вообще когда важна точность. Наугад отвечать не надо.
-- В сообщении могут быть пересланные сообщения и ответы на чужие реплики — они
-  идут отдельными блоками с пометкой «Пересланное сообщение» или «Ответ на
-  сообщение». Это часть вопроса: смотри их, не переспрашивай.
+- В сообщении могут быть пересланные сообщения, ответы на чужие реплики и
+  репосты записей — они идут отдельными блоками с пометкой «Пересланное
+  сообщение», «Ответ на сообщение» или «Запись со стены». Это часть вопроса:
+  смотри их, не переспрашивай. Текст записи со стены приходит целиком, вместе
+  с картинками к ней, так что «не вижу содержимое поста» отвечать не надо.
 - Голосовые ты не слышишь. Иногда ВК прикладывает к ним свою расшифровку
   («расшифровка: …») — тогда работай с ней. Если её нет, скажи, что голосовое
   недоступно, и попроси написать текстом.
@@ -139,6 +151,16 @@ def _resolves_to_private(host: str) -> bool:
         return not ipaddress.ip_address(host).is_global
     except ValueError:
         pass
+    # Старые формы записи адреса: 2130706433 и 127.1 — это тот же 127.0.0.1.
+    # Их разбирает inet_aton, а вот ip_address выше на них спотыкается; на том,
+    # что их поймёт системный резолвер, полагаться нельзя — в glibc понимает, в
+    # других реализациях нет.
+    try:
+        packed = socket.inet_aton(host)
+    except OSError:
+        pass
+    else:
+        return not ipaddress.IPv4Address(packed).is_global
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:
@@ -152,8 +174,12 @@ def _resolves_to_private(host: str) -> bool:
     return False
 
 
+def _inside(target: Path, root: Path) -> bool:
+    return target == root or root in target.parents
+
+
 def _make_tool_guard(workspace: Path):
-    """Хук, пропускающий Read только внутри рабочей папки.
+    """Хук, ограничивающий инструменты агента.
 
     Именно хук, а не can_use_tool: тот вызывается лишь для инструментов, по
     которым CLI сам не принял решение, а Read он авторазрешает как безопасный —
@@ -163,8 +189,23 @@ def _make_tool_guard(workspace: Path):
     только на него нельзя: это чужая настройка по умолчанию, которая может
     измениться с версией CLI, а цена промаха — токены ВК и Claude из
     /proc/1/environ, выданные в переписку по первой просьбе.
+
+    Границы разные для чтения и для поиска. Read пускается только в
+    workspace/media — туда и только туда бот кладёт присланные файлы, и больше
+    агенту читать нечего. Рабочая папка целиком для Read не годится: рядом
+    лежат state.json и всё, что когда-нибудь окажется смонтировано внутрь неё.
+    Glob ограничен рабочей папкой: он показывает только имена, а запрет на
+    шаблон без пути ломал бы обычный поиск.
     """
-    root = workspace.resolve()
+    cwd = workspace.resolve()
+    read_root = (cwd / MEDIA_SUBDIR).resolve()
+
+    def resolve(raw: str) -> Path:
+        # Относительный путь агент задаёт от своей рабочей папки. Path.resolve()
+        # взял бы рабочую папку процесса бота (/app) — это другая директория, и
+        # проверка получалась бы не про тот путь.
+        path = Path(raw)
+        return path.resolve() if path.is_absolute() else (cwd / path).resolve()
 
     async def guard(
         input_data: dict[str, Any], tool_use_id: str | None, context: Any
@@ -179,28 +220,31 @@ def _make_tool_guard(workspace: Path):
                 verdict = "Не указан путь к файлу."
             else:
                 try:
-                    target = Path(raw).resolve()
+                    target = resolve(raw)
                 except (OSError, ValueError):
                     verdict = "Некорректный путь."
                 else:
-                    if target != root and root not in target.parents:
-                        log.warning("Отклонено чтение вне рабочей папки: %s", target)
+                    if not _inside(target, read_root):
+                        log.warning("Отклонено чтение вне папки вложений: %s", target)
                         verdict = "Читать можно только файлы, присланные в этой переписке."
 
         elif tool_name == "Glob":
-            # Сам по себе Glob ничего не читает, но абсолютным шаблоном можно
-            # осмотреть файловую систему сервера — этого агенту тоже не нужно.
+            # Сам по себе Glob ничего не читает, но шаблоном можно осмотреть
+            # файловую систему сервера — этого агенту тоже не нужно. Проверяем
+            # и относительные пути: «../..» уводит наружу не хуже абсолютного.
             for key in ("path", "pattern"):
                 value = tool_input.get(key)
-                if not isinstance(value, str) or not value.startswith("/"):
+                if not isinstance(value, str) or not value:
                     continue
-                base = Path(value.split("*", 1)[0])
+                # До первого спецсимвола шаблона — дальше начинается маска, и
+                # каталогом это уже не является.
+                base = re.split(r"[*?\[]", value, maxsplit=1)[0]
                 try:
-                    target = base.resolve()
+                    target = resolve(base)
                 except (OSError, ValueError):
                     verdict = "Некорректный путь."
                     break
-                if target != root and root not in target.parents:
+                if not _inside(target, cwd):
                     log.warning("Отклонён поиск файлов вне рабочей папки: %s", value)
                     verdict = "Искать можно только в рабочей папке."
                     break
@@ -210,10 +254,23 @@ def _make_tool_guard(workspace: Path):
             # соседние сервисы на хосте. WebFetch — единственный инструмент,
             # которым туда можно попасть, в том числе по ссылке со страницы.
             url = tool_input.get("url")
-            host = urlparse(url).hostname if isinstance(url, str) else None
-            if host and await asyncio.to_thread(_resolves_to_private, host):
+            parsed = urlparse(url) if isinstance(url, str) else None
+            if parsed is None or parsed.scheme not in ("http", "https"):
+                # file:// прочитал бы что угодно на диске в обход проверки выше.
+                log.warning("Отклонён WebFetch с неподдерживаемой схемой: %r", url)
+                verdict = "Открывать можно только адреса http и https."
+            elif parsed.hostname and await asyncio.to_thread(
+                _resolves_to_private, parsed.hostname
+            ):
                 log.warning("Отклонён запрос во внутреннюю сеть: %s", url)
                 verdict = "Во внутреннюю сеть сервера ходить нельзя, только в интернет."
+
+        elif tool_name not in TOOLS:
+            # Набор инструментов уже задан в options, но пусть последнее слово
+            # остаётся за хуком: он в нашем коде и не зависит от того, как
+            # очередная версия CLI поймёт allowed_tools.
+            log.warning("Отклонён инструмент вне набора: %s", tool_name)
+            verdict = "Такого инструмента у тебя нет."
 
         if verdict is None:
             return {}
@@ -235,7 +292,9 @@ def _build_options(
     model: str | None,
     max_turns: int,
 ) -> ClaudeAgentOptions:
-    env: dict[str, str] = {}
+    # SDK передаёт подпроцессу всё окружение бота и накрывает его этим словарём.
+    # Убрать ключ насовсем нельзя — только перекрыть, поэтому затираем пустым.
+    env: dict[str, str] = {key: "" for key in _SECRET_ENV_KEYS}
     # Транскрипты сессий нужны — на них держится resume, — но пусть SDK не
     # подмешивает пользовательские настройки и CLAUDE.md с хост-машины.
     token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()

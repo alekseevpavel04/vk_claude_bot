@@ -4,6 +4,8 @@ deploy/deploy.env
 
 # runtime state and downloaded attachments
 workspace/
+# home directory of Claude Code inside the container: transcripts and config
+claude-home/
 state.json
 
 # python

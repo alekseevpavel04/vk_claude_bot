@@ -43,7 +43,13 @@ class Config:
     # переписке всё равно не нужна.
     session_ttl_hours: int
     max_attachment_bytes: int
+    # Потолок на всю папку вложений. Диск на VPS общий с соседним сервисом,
+    # и «кончилось место» для него — отказ, а не неудобство.
+    max_media_total_bytes: int
     max_turns: int
+    # Сколько ждать продолжения, прежде чем браться за ответ: пересланное с
+    # телефона и комментарий к нему приходят двумя сообщениями подряд.
+    merge_window_seconds: float
     show_tool_progress: bool
     # Значение из .env осталось шаблонным (иксы из .env.example).
     claude_token_is_placeholder: bool
@@ -75,6 +81,16 @@ def _int(name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} должен быть целым числом, получено: {raw!r}") from exc
+
+
+def _float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip().replace(",", ".")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} должен быть числом, получено: {raw!r}") from exc
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -148,7 +164,9 @@ def load_config() -> Config:
         media_ttl_days=_int("MEDIA_TTL_DAYS", 7),
         session_ttl_hours=_int("SESSION_TTL_HOURS", 168),
         max_attachment_bytes=_int("MAX_ATTACHMENT_MB", 20) * 1024 * 1024,
+        max_media_total_bytes=_int("MEDIA_MAX_TOTAL_MB", 512) * 1024 * 1024,
         max_turns=_int("MAX_TURNS", 30),
+        merge_window_seconds=max(0.0, _float("MESSAGE_MERGE_SECONDS", 3.0)),
         show_tool_progress=_bool("SHOW_TOOL_PROGRESS", True),
         claude_token_is_placeholder=token_is_placeholder,
     )

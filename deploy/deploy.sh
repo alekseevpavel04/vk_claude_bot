@@ -107,6 +107,7 @@ sync_code() {
         --exclude=.venv \
         --exclude=venv \
         --exclude=workspace \
+        --exclude=claude-home \
         --exclude=state.json \
         --exclude=.env \
         --exclude=deploy/deploy.env \
@@ -115,14 +116,28 @@ sync_code() {
         . | remote_in "${SUDO}tar -xzf - -C '$REMOTE_DIR'"
 
     step "Заливаю .env (права 600)"
-    remote_in "${SUDO}tee '$REMOTE_DIR/.env' >/dev/null && ${SUDO}chmod 600 '$REMOTE_DIR/.env'" \
+    # umask до создания файла: сначала tee, потом chmod оставлял бы .env с
+    # токенами доступным всем на те доли секунды, что между ними.
+    remote_in "umask 077 && ${SUDO}tee '$REMOTE_DIR/.env' >/dev/null && ${SUDO}chmod 600 '$REMOTE_DIR/.env'" \
         < "$PROJECT_DIR/.env"
 
+    migrate_claude_home
+
     # Контейнер работает под uid 10001 и должен писать в примонтированные папки:
-    # workspace (состояние, вложения) и workspace/claude-home (транскрипты сессий).
-    remote "${SUDO}mkdir -p '$REMOTE_DIR/workspace/home' \
-        && ${SUDO}chown -R $CONTAINER_UID:$CONTAINER_UID '$REMOTE_DIR/workspace'"
+    # workspace (состояние, вложения) и claude-home (транскрипты сессий).
+    remote "${SUDO}mkdir -p '$REMOTE_DIR/workspace' '$REMOTE_DIR/claude-home' \
+        && ${SUDO}chown -R $CONTAINER_UID:$CONTAINER_UID '$REMOTE_DIR/workspace' '$REMOTE_DIR/claude-home'"
     echo "код на месте"
+}
+
+migrate_claude_home() {
+    # Домашняя папка Claude Code переехала из workspace/home в claude-home:
+    # внутри workspace она была видна агенту, а в ней транскрипты всех
+    # разговоров. Переносим на месте, иначе развалится resume существующих.
+    remote "test -d '$REMOTE_DIR/workspace/home' && test ! -e '$REMOTE_DIR/claude-home'" || return 0
+    step "Переношу домашнюю папку Claude из workspace/home в claude-home"
+    remote "${SUDO}mv '$REMOTE_DIR/workspace/home' '$REMOTE_DIR/claude-home'"
+    echo "перенесено"
 }
 
 clear_kill_flag() {

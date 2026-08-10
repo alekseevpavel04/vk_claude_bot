@@ -4,6 +4,7 @@
 .venv
 venv
 workspace
+claude-home
 state.json
 .env
 deploy
