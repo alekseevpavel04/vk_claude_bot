@@ -318,15 +318,36 @@ async def run_turn(
                 is_error = message.is_error or message.subtype != "success"
                 if is_error:
                     log.warning(
-                        "Ход завершился с ошибкой: subtype=%s terminal_reason=%s errors=%s",
+                        "Ход завершился с ошибкой: subtype=%s terminal_reason=%s "
+                        "errors=%s api_status=%s result=%r",
                         message.subtype,
                         message.terminal_reason,
                         message.errors,
+                        message.api_error_status,
+                        (message.result or "")[:200],
                     )
     except CLINotFoundError as exc:
         raise RuntimeError(
             "Не найден Claude Code CLI. Установи его: npm install -g @anthropic-ai/claude-code"
         ) from exc
+    except Exception as exc:  # noqa: BLE001
+        # Получив результат с is_error, CLI намеренно выходит ненулевым кодом, а
+        # SDK превращает это в голое исключение — с текстом вроде «returned an
+        # error result: success», где success это просто subtype. Сам ответ к
+        # этому моменту уже получен, и ронять из-за такого ход незачем.
+        log.warning("Агент завершился с ошибкой: %s", exc)
+        limit_note = _exhausted_limit_note(limits)
+        if limit_note:
+            return TurnResult(
+                text=limit_note, session_id=session_id, is_error=True,
+                cost_usd=cost, rate_limits=limits,
+            )
+        if not (result_text or collected):
+            return TurnResult(
+                text=f"Claude прервал работу: {exc}", session_id=session_id, is_error=True,
+                cost_usd=cost, rate_limits=limits,
+            )
+        is_error = True
 
     if fatal:
         return TurnResult(
@@ -467,10 +488,11 @@ def describe_limits(limits: dict[str, RateLimitInfo]) -> str:
 
     text = "Лимиты подписки Claude:\n" + "\n".join(lines)
     if all(info.utilization is None for info in limits.values()):
-        # Точный процент приходит не всегда — у API для этого канала его просто нет.
+        # Процент приходит не всегда: API начинает его слать только ближе к
+        # потолку (на практике — около 90%). Пока молчит — расход невелик.
         text += (
-            "\nТочный процент Claude здесь не сообщает — только состояние. "
-            "Предупрежу сам, когда подписка подойдёт к лимиту."
+            "\nПроцент Claude пока не сообщает — он появляется ближе к лимиту. "
+            "Предупрежу сам, когда это случится."
         )
     return text
 
@@ -562,6 +584,19 @@ async def forget_stale_sessions(
     if removed:
         log.info("Удалено забытых транскриптов: %s", removed)
     return removed
+
+
+def _exhausted_limit_note(limits: dict[str, RateLimitInfo]) -> str | None:
+    """Понятное объяснение вместо технической ошибки, если упёрлись в лимит."""
+    for kind, info in sorted(limits.items()):
+        if info.status != "rejected":
+            continue
+        name = _LIMIT_NAMES.get(kind, kind)
+        return (
+            f"Лимит подписки Claude исчерпан ({name}).{_reset_note(info)} "
+            "Раньше этого я отвечать не смогу."
+        )
+    return None
 
 
 def _explain_error(kind: str) -> str:
