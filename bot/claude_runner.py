@@ -233,6 +233,64 @@ def _human_delay(seconds: float) -> str:
     return f"{days} дн {hours} ч" if hours else f"{days} дн"
 
 
+# Пороги, на которых бот сам предупреждает о расходе лимита.
+LIMIT_THRESHOLDS = (25, 50, 75, 90, 100)
+
+
+def utilization_percent(info: RateLimitInfo) -> float | None:
+    """API отдаёт долю 0..1 либо сразу проценты — приводим к процентам."""
+    if info.utilization is None:
+        return None
+    return info.utilization * 100 if info.utilization <= 1 else info.utilization
+
+
+def _reset_note(info: RateLimitInfo) -> str:
+    if not info.resets_at:
+        return ""
+    left = info.resets_at - time.time()
+    return f" Обнулится через {_human_delay(left)}." if left > 0 else " Уже обнулился."
+
+
+def threshold_alerts(
+    marks: dict[str, int], limits: dict[str, RateLimitInfo]
+) -> tuple[list[str], dict[str, int]]:
+    """Сообщения о пересечённых порогах расхода.
+
+    `marks` — самый высокий порог, о котором уже предупреждали, по каждому виду
+    лимита. Возвращает новые сообщения и обновлённые отметки: предупреждаем один
+    раз на порог, а когда окно обнуляется и расход падает — отметка снимается.
+    """
+    alerts: list[str] = []
+    updated = dict(marks)
+
+    for kind, info in sorted(limits.items()):
+        name = _LIMIT_NAMES.get(kind, kind)
+        percent = utilization_percent(info)
+
+        if info.status == "rejected":
+            reached = 100
+        elif percent is None:
+            continue
+        else:
+            reached = max((step for step in LIMIT_THRESHOLDS if percent >= step), default=0)
+
+        previous = updated.get(kind, 0)
+        if reached == previous:
+            continue
+        updated[kind] = reached
+        if reached < previous:
+            continue  # окно обнулилось — молча снимаем отметку
+
+        if reached >= 100:
+            alerts.append(f"Лимит подписки Claude исчерпан ({name}).{_reset_note(info)}")
+        else:
+            alerts.append(
+                f"Израсходовано {reached}% лимита подписки Claude ({name}).{_reset_note(info)}"
+            )
+
+    return alerts, updated
+
+
 def describe_limits(limits: dict[str, RateLimitInfo]) -> str:
     if not limits:
         return (

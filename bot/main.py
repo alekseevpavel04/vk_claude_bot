@@ -34,13 +34,16 @@ HELP_TEXT = """\
 Умею искать в интернете, если вопрос про свежие данные.
 
 Команды:
+/stop — прервать ответ, который я сейчас пишу. Если я свободен — выключить меня
+        на сервере (спрошу подтверждение)
+/cancel — только прервать ответ, никогда не выключает
 /new — забыть контекст этого разговора и начать заново
-/cancel — прервать ответ, который я сейчас пишу
 /limits — сколько потрачено лимитов подписки и когда обнулятся
 /status — чем занят прямо сейчас
 /clear — полная очистка: все разговоры и все файлы
-/stop — выключить меня на сервере (спрошу подтверждение)
-/help — это сообщение\
+/help — это сообщение
+
+О расходе лимитов предупрежу сам на 25, 50, 75, 90 и 100 процентах.\
 """
 
 # Сколько секунд действует подтверждение /stop.
@@ -155,9 +158,11 @@ class PeerWorker:
 
             if result.session_id:
                 bot.sessions.remember(self.peer_id, result.session_id)
-            bot.remember_limits(result.rate_limits)
+            alerts = bot.remember_limits(result.rate_limits)
 
             await bot.reply(self.peer_id, result.text)
+            for alert in alerts:
+                await bot.reply(self.peer_id, alert)
             if result.cost_usd:
                 log.info("Ход для %s стоил $%.4f", self.peer_id, result.cost_usd)
         finally:
@@ -208,6 +213,8 @@ class Bot:
         self._stop_asked_at: float | None = None
         self._limits: dict[str, Any] = {}
         self._limits_at = 0.0
+        # Самый высокий порог расхода, о котором уже предупреждали, по видам лимита.
+        self._limit_marks: dict[str, int] = {}
         # Долгие команды не должны блокировать приём событий Long Poll.
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -216,10 +223,14 @@ class Bot:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    def remember_limits(self, limits: dict[str, Any]) -> None:
-        if limits:
-            self._limits = limits
-            self._limits_at = time.monotonic()
+    def remember_limits(self, limits: dict[str, Any]) -> list[str]:
+        """Запоминает состояние лимитов и отдаёт предупреждения о новых порогах."""
+        if not limits:
+            return []
+        self._limits = limits
+        self._limits_at = time.monotonic()
+        alerts, self._limit_marks = claude_runner.threshold_alerts(self._limit_marks, limits)
+        return alerts
 
     # --- отправка --------------------------------------------------------
 
@@ -309,6 +320,11 @@ class Bot:
             return True
 
         if command in {"stop", "стоп"}:
+            # Пока идёт ответ, «стоп» логичнее читать как «прекрати это»;
+            # выключение имеет смысл только когда бот и так свободен.
+            worker = self._workers.get(peer_id)
+            if worker is not None and worker.cancel_current():
+                return True  # сообщение отправит сам воркер, поймав CancelledError
             await self._stop(peer_id)
             return True
 
