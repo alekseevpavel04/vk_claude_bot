@@ -165,8 +165,12 @@ def load_config() -> Config:
         session_ttl_hours=_int("SESSION_TTL_HOURS", 168),
         max_attachment_bytes=_int("MAX_ATTACHMENT_MB", 20) * 1024 * 1024,
         max_media_total_bytes=_int("MEDIA_MAX_TOTAL_MB", 512) * 1024 * 1024,
-        max_turns=_int("MAX_TURNS", 30),
-        merge_window_seconds=max(0.0, _float("MESSAGE_MERGE_SECONDS", 3.0)),
+        max_turns=_int("MAX_TURNS", 40),
+        # Пять секунд, а не три: телефон выкладывает прикреплённые фотографии по
+        # мере загрузки, и в живой переписке два снимка пришли с разрывом ровно
+        # в 3 секунды — на трёхсекундном окне это подбрасывание монетки, склеятся
+        # они в один вопрос или второй получит «занят предыдущим».
+        merge_window_seconds=max(0.0, _float("MESSAGE_MERGE_SECONDS", 5.0)),
         show_tool_progress=_bool("SHOW_TOOL_PROGRESS", True),
         claude_token_is_placeholder=token_is_placeholder,
     )

@@ -16,7 +16,7 @@ from typing import Any
 
 import aiohttp
 
-from . import claude_runner, formatting
+from . import agent_tools, claude_runner, formatting
 from .config import Config, ConfigError, load_config
 from .http import make_session
 from .media import MediaStore, MessagePart
@@ -34,6 +34,13 @@ PROGRESS_MAX_PER_TURN = 12
 HELP_TEXT = """\
 Просто напиши вопрос — отвечу. Можно кидать фото и документы, я их посмотрю.
 Умею искать в интернете, если вопрос про свежие данные.
+
+Ещё умею:
+— открывать сайты настоящим браузером и смотреть на них глазами, если текстом
+  страница не даётся или важно, как оно выглядит;
+— присылать картинки и файлы прямо сюда: «пришли фото вот отсюда»;
+— смотреть рейтинги вин на Vivino. Кидай фото бутылки или целой полки: скажу,
+  у чего какая оценка. Хочешь проверить все — так и напиши.
 
 Команды:
 /stop — прервать ответ; если я свободен, выключить меня (спрошу подтверждение)
@@ -233,6 +240,17 @@ class PeerWorker:
             bot.sessions.reset(self.peer_id)
             stored = None
 
+        # Свои инструменты агента знают, с кем идёт разговор: «пришли фото»
+        # обязано уйти тому, кто спросил, а не тому, кто спросил последним.
+        tools_context = agent_tools.ToolContext(
+            peer_id=self.peer_id,
+            vk=bot.vk,
+            http=bot.vk.session,
+            media_dir=bot.config.media_dir,
+            max_bytes=bot.config.max_attachment_bytes,
+            enforce_cap=bot.media.enforce_total_cap,
+        )
+
         try:
             result = await asyncio.wait_for(
                 claude_runner.run_turn(
@@ -242,6 +260,7 @@ class PeerWorker:
                     model=bot.config.claude_model,
                     max_turns=bot.config.max_turns,
                     on_tool=progress.report if bot.config.show_tool_progress else None,
+                    tools_context=tools_context,
                 ),
                 timeout=TURN_TIMEOUT,
             )
@@ -666,7 +685,20 @@ def _build_prompt(messages: list[list[MessagePart]]) -> str:
     out = ["\n".join(own) if own else "(сообщение без текста)"]
     out.extend(blocks)
     if files:
-        out.append("Приложенные файлы (прочитай их инструментом Read):\n" + "\n".join(files))
+        # Число прописью в самом сообщении, а не просто список путей. Список
+        # модель просматривает и берёт из него первый файл; счётчик, с которым
+        # можно сверить число сделанных Read, она отрабатывает. Это ровно та
+        # ошибка, на которую жаловался человек: четыре фото приложено, ответ по
+        # первому.
+        if len(files) == 1:
+            head = "Приложенный файл (прочитай его инструментом Read):"
+        else:
+            head = (
+                f"Приложено файлов: {len(files)}. Прочитай инструментом Read КАЖДЫЙ — "
+                f"отдельным вызовом на каждый, все {len(files)} — и только потом отвечай. "
+                "Ответ по части файлов неверен, даже если по ним всё понятно."
+            )
+        out.append(head + "\n" + "\n".join(files))
     if notes:
         out.append("Прочие вложения:\n" + "\n".join(notes))
 

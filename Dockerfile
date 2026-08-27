@@ -10,9 +10,15 @@ ARG CLAUDE_CODE_VERSION=2.1.226
 
 # Claude Code CLI — Python SDK запускает его подпроцессом.
 # git нужен самому CLI для части операций; ca-certificates — для HTTPS.
+#
+# chromium — это «глаза» бота: bot/browser.py открывает им страницы и снимает
+# экран. Берём системный пакет Debian, а не сборку Playwright: та тянет за собой
+# node-драйвер и полгигабайта своего браузера, а нам нужен один бинарник.
+# Шрифты обязательны: без них вместо текста на снимке будут пустые квадраты.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 python3-venv ca-certificates git \
+        chromium fonts-liberation fonts-dejavu-core fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
@@ -26,7 +32,8 @@ RUN python3 -m venv /opt/venv \
 
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    CHROMIUM_PATH=/usr/bin/chromium
 
 COPY bot ./bot
 COPY scripts ./scripts

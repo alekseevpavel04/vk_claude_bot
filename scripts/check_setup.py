@@ -73,12 +73,23 @@ async def check_vk(config) -> None:
             server = await vk.get_long_poll_server()
             report(OK, "Long Poll включён", f"ts={server['ts']}")
         except VkError as exc:
-            hint = (
-                "Long Poll выключен: Управление → Работа с API → Long Poll API → «Включён», "
-                "и на вкладке «Типы событий» включи «Входящее сообщение»"
-                if exc.code in (15, 100)
-                else exc.message
-            )
+            if exc.code == 15:
+                # Самая частая причина — ключ без права «Управление сообществом»:
+                # сообщения им читаются и пишутся, а Long Poll не отдаётся.
+                hint = (
+                    "у ключа нет права «Управление сообществом» — без него ВК не отдаёт "
+                    "Long Poll, и бот не увидит ни одного сообщения. Перевыпусти ключ "
+                    "сразу со всеми четырьмя галочками: «Управление сообществом», "
+                    "«Сообщения сообщества», «Фотографии», «Документы». Если право есть — "
+                    "проверь, что Long Poll включён: Работа с API → Long Poll API"
+                )
+            elif exc.code == 100:
+                hint = (
+                    "Long Poll выключен: Управление → Работа с API → Long Poll API → «Включён», "
+                    "и на вкладке «Типы событий» включи «Входящее сообщение»"
+                )
+            else:
+                hint = exc.message
             report(FAIL, "Long Poll", f"ошибка {exc.code}: {hint}")
 
         try:
@@ -87,6 +98,63 @@ async def check_vk(config) -> None:
             report(OK, "Белый список", names)
         except VkError as exc:
             report(WARN, "Белый список", f"не удалось проверить id: {exc.message}")
+
+        # Права на отправку файлов. Проверяем именно вызовом, а не по описанию
+        # ключа: ключ сообщества с одними «сообщениями» отвечает на эти методы
+        # ошибкой 15, и обнаруживается это иначе только в момент, когда человек
+        # просит прислать фото.
+        peer = sorted(config.allowed_user_ids)[0]
+        for method, what in (
+            ("photos.getMessagesUploadServer", "фотографии"),
+            ("docs.getMessagesUploadServer", "документы"),
+        ):
+            params = {"peer_id": peer}
+            if method.startswith("docs"):
+                params["type"] = "doc"
+            try:
+                await vk.call(method, **params)
+                report(OK, f"Право слать {what}", "есть")
+            except VkError as exc:
+                if exc.code == 15:
+                    hint = (
+                        "у ключа нет прав. Перевыпусти ключ сообщества, отметив «Фотографии» "
+                        "и «Документы»: Управление → Работа с API → Ключи доступа. "
+                        "Без этого бот не сможет ничего присылать, всё остальное работает"
+                    )
+                elif exc.code == 901:
+                    # Не про права ключа: ВК запрещает сообществу писать первым.
+                    # Как только человек напишет сообществу сам, запрет снимается.
+                    hint = (
+                        "человек ещё ни разу не писал этому сообществу, и ВК не даёт "
+                        "написать ему первым. Пройдёт само, как только он отправит боту "
+                        "любое сообщение — например /help"
+                    )
+                else:
+                    hint = exc.message
+                report(WARN, f"Право слать {what}", hint)
+
+
+async def check_browser() -> None:
+    """Не «бинарник на месте», а «страница открылась»: разница принципиальная."""
+    from bot import browser
+
+    binary = browser.find_chromium()
+    if binary is None:
+        report(
+            WARN,
+            "Браузер",
+            "Chromium не найден. Бот будет работать, но не сможет смотреть на страницы "
+            "и снимать экран. В образе он ставится сам; локально задай CHROMIUM_PATH",
+        )
+        return
+    try:
+        page = await asyncio.wait_for(
+            browser.render("https://example.com", want_details=True, settle=0.5), timeout=90
+        )
+    except Exception as exc:  # noqa: BLE001
+        report(FAIL, "Браузер", f"{binary} не открыл страницу: {exc}")
+        return
+    report(OK, "Браузер", f"{binary}, example.com открылся: «{page.title}»")
 
 
 def check_claude_cli() -> bool:
@@ -165,6 +233,9 @@ async def main() -> int:
     print()
 
     await check_vk(config)
+    print()
+
+    await check_browser()
     print()
 
     if check_claude_cli():

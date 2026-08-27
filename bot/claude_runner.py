@@ -8,17 +8,14 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import logging
 import os
 import re
-import socket
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -35,11 +32,29 @@ from claude_agent_sdk import (
     query,
 )
 
+from . import agent_tools
+from .netcheck import url_problem
+
 log = logging.getLogger(__name__)
 
 # Набор инструментов задаётся явно: всего, чего здесь нет, у агента просто не
 # существует. Bash, Write и Edit не входят — бот не должен ничего менять на VPS.
 TOOLS = ["Read", "Glob", "WebSearch", "WebFetch", "TodoWrite"]
+
+# Свои инструменты бота (bot/agent_tools.py): браузер, отправка файлов, Vivino.
+# Это не «немного больше возможностей вообще», а конкретные функции в коде бота:
+# выполнить произвольную команду ими по-прежнему нельзя.
+OWN_TOOLS = list(agent_tools.FULL_TOOL_NAMES)
+ALLOWED_TOOLS = TOOLS + OWN_TOOLS
+
+# Инструменты, которым в аргументах приезжает адрес. Его проверяет и хук, и сам
+# инструмент: цена промаха — метаданные облака и соседи по хосту.
+_URL_ARGUMENTS = {
+    "WebFetch": "url",
+    "mcp__bot__page_read": "url",
+    "mcp__bot__page_screenshot": "url",
+    "mcp__bot__save_image": "url",
+}
 
 # Единственная папка, которую агенту разрешено читать: сюда MediaStore кладёт
 # присланные вложения. Имя должно совпадать с config.media_dir.
@@ -81,6 +96,25 @@ SYSTEM_PROMPT = """\
 Инструменты:
 - WebSearch и WebFetch — когда вопрос про свежие события, цены, курсы, версии,
   документацию, и вообще когда важна точность. Наугад отвечать не надо.
+- page_screenshot — снимок страницы настоящим браузером. Он сохраняется
+  картинкой, ты открываешь её инструментом Read и смотришь на сайт своими
+  глазами. Бери, когда важно, как оно выглядит: товар, украшение, фотография,
+  график, таблица, карта, — и когда страница текстом не даётся.
+- page_read — та же страница браузером, но текстом: содержимое, адреса картинок
+  на ней и ссылки. Бери, когда WebFetch не открыл страницу или вернул огрызок,
+  а ещё когда нужны адреса картинок.
+- Часть сайтов браузер не пустит: покажет «проверяем браузер», капчу или откажет
+  по адресу сервера. Инструмент об этом честно пишет. В таком случае не
+  пересказывай заглушку и не выдумывай, что там было: скажи одной фразой, что
+  сайт не открылся, и предложи, что можешь вместо этого — поискать в другом
+  месте или дать ссылку. Выдачу поисковиков браузером не открывай, для поиска
+  есть WebSearch.
+- send_photo и send_file — прислать человеку картинку или файл прямо в
+  переписку. «Пришли фото» — это про них: находишь картинку (адреса покажет
+  page_read), отправляешь send_photo, человек сразу её видит. Отправленное не
+  отправляй второй раз и не пересказывай словами, что на нём.
+- save_image — скачать картинку к себе, чтобы разглядеть её через Read.
+- wine_search — рейтинги вин на Vivino, про него отдельно ниже.
 - В сообщении могут быть пересланные сообщения, ответы на чужие реплики и
   репосты записей — они идут отдельными блоками с пометкой «Пересланное
   сообщение», «Ответ на сообщение» или «Запись со стены». Это часть вопроса:
@@ -90,12 +124,28 @@ SYSTEM_PROMPT = """\
   («расшифровка: …») — тогда работай с ней. Если её нет, скажи, что голосовое
   недоступно, и попроси написать текстом.
 - Read — читает присланные файлы и фотографии, пути к ним указаны в сообщении.
+  Читай их ВСЕ, каждый отдельным вызовом, и только потом отвечай. Сколько файлов
+  приложено, написано в сообщении числом — сверься с ним. Это твоя самая частая
+  ошибка: человек прикладывает четыре фотографии, ты смотришь первую и отвечаешь
+  по ней, а про остальные три говоришь так, будто их видел. Прикинуть по первому
+  файлу, что на других, нельзя — фотографии разные.
   ВАЖНО про его формат: текстовые файлы Read показывает с номерами строк слева,
   в виде «     5→содержимое строки». Номер и стрелку дорисовывает сам инструмент,
   в файле их нет. Никогда не принимай их за содержимое: если в файле числа, то
   номера строк к этим числам отношения не имеют и в подсчёты не идут.
 - Файлы ты не редактируешь и команды не выполняешь — таких инструментов у тебя
   нет. Если просят сделать что-то на сервере, честно скажи, что не можешь.
+
+Про вино. Рейтинг не бери из памяти — только wine_search: память тут врёт
+уверенно и мимо. С фотографии читай этикетку целиком: производитель, название,
+сорт, год. Если на фото несколько бутылок или фотографий пришло несколько —
+собери все названия и передай их ОДНИМ вызовом списком. Просят проверить все —
+значит все, без «самых интересных». Названия пиши латиницей, как на этикетке.
+На каждое название Vivino отдаёт несколько кандидатов: бери тот, чьё имя
+действительно совпадает с этикеткой, а если ничего не совпало — так и скажи,
+вместо того чтобы выдать похожее за нужное. В ответе на каждое вино хватает
+строки: название, оценка и сколько людей её ставило, — и общий вывод, что из
+этого брать.
 """
 
 # Как показывать вызовы инструментов в чате.
@@ -105,6 +155,12 @@ _TOOL_LABELS: dict[str, tuple[str, str | None]] = {
     "Read": ("📄 Смотрю", "file_path"),
     "Glob": ("📂 Ищу файлы", "pattern"),
     "TodoWrite": ("📝 Планирую", None),
+    "mcp__bot__wine_search": ("🍷 Смотрю рейтинги", None),
+    "mcp__bot__page_read": ("🌐 Открываю браузером", "url"),
+    "mcp__bot__page_screenshot": ("👀 Смотрю на страницу", "url"),
+    "mcp__bot__save_image": ("🖼 Забираю картинку", "url"),
+    "mcp__bot__send_photo": ("📤 Отправляю фото", "source"),
+    "mcp__bot__send_file": ("📎 Отправляю файл", "source"),
 }
 
 
@@ -139,39 +195,6 @@ def _log_stderr(line: str) -> None:
     line = line.strip()
     if line:
         log.warning("claude stderr: %s", line)
-
-
-def _resolves_to_private(host: str) -> bool:
-    """Ведёт ли адрес во внутреннюю сеть (loopback, LAN, метаданные облака).
-
-    Проверяется и то, во что имя резолвится: иначе достаточно любого домена,
-    указывающего на 169.254.169.254 или 172.17.0.1.
-    """
-    try:
-        return not ipaddress.ip_address(host).is_global
-    except ValueError:
-        pass
-    # Старые формы записи адреса: 2130706433 и 127.1 — это тот же 127.0.0.1.
-    # Их разбирает inet_aton, а вот ip_address выше на них спотыкается; на том,
-    # что их поймёт системный резолвер, полагаться нельзя — в glibc понимает, в
-    # других реализациях нет.
-    try:
-        packed = socket.inet_aton(host)
-    except OSError:
-        pass
-    else:
-        return not ipaddress.IPv4Address(packed).is_global
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except OSError:
-        return False  # не резолвится — пусть WebFetch сам разбирается
-    for info in infos:
-        try:
-            if not ipaddress.ip_address(info[4][0]).is_global:
-                return True
-        except ValueError:
-            continue
-    return False
 
 
 def _inside(target: Path, root: Path) -> bool:
@@ -249,23 +272,25 @@ def _make_tool_guard(workspace: Path):
                     verdict = "Искать можно только в рабочей папке."
                     break
 
-        elif tool_name == "WebFetch":
+        elif tool_name in _URL_ARGUMENTS:
             # Контейнер видит внутреннюю сеть сервера: метаданные облака,
-            # соседние сервисы на хосте. WebFetch — единственный инструмент,
-            # которым туда можно попасть, в том числе по ссылке со страницы.
-            url = tool_input.get("url")
-            parsed = urlparse(url) if isinstance(url, str) else None
-            if parsed is None or parsed.scheme not in ("http", "https"):
-                # file:// прочитал бы что угодно на диске в обход проверки выше.
-                log.warning("Отклонён WebFetch с неподдерживаемой схемой: %r", url)
-                verdict = "Открывать можно только адреса http и https."
-            elif parsed.hostname and await asyncio.to_thread(
-                _resolves_to_private, parsed.hostname
-            ):
-                log.warning("Отклонён запрос во внутреннюю сеть: %s", url)
-                verdict = "Во внутреннюю сеть сервера ходить нельзя, только в интернет."
+            # соседние сервисы на хосте. Инструменты с адресом — единственный
+            # способ туда попасть, в том числе по ссылке со страницы.
+            url = tool_input.get(_URL_ARGUMENTS[tool_name])
+            verdict = await url_problem(url if isinstance(url, str) else "")
+            if verdict:
+                log.warning("Отклонён %s: %s (%r)", tool_name, verdict, url)
 
-        elif tool_name not in TOOLS:
+        elif tool_name in ("mcp__bot__send_photo", "mcp__bot__send_file"):
+            # Отправлять можно и по адресу, и лежащим файлом: адрес проверяем
+            # здесь, а путь — в самом инструменте, он знает папку вложений.
+            source = tool_input.get("source")
+            if isinstance(source, str) and source.lower().startswith(("http://", "https://")):
+                verdict = await url_problem(source)
+                if verdict:
+                    log.warning("Отклонена отправка с адреса: %s (%r)", verdict, source)
+
+        elif tool_name not in ALLOWED_TOOLS:
             # Набор инструментов уже задан в options, но пусть последнее слово
             # остаётся за хуком: он в нашем коде и не зависит от того, как
             # очередная версия CLI поймёт allowed_tools.
@@ -291,6 +316,7 @@ def _build_options(
     resume: str | None,
     model: str | None,
     max_turns: int,
+    tools_context: agent_tools.ToolContext | None = None,
 ) -> ClaudeAgentOptions:
     # SDK передаёт подпроцессу всё окружение бота и накрывает его этим словарём.
     # Убрать ключ насовсем нельзя — только перекрыть, поэтому затираем пустым.
@@ -301,10 +327,19 @@ def _build_options(
     if token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
 
+    # Свои инструменты живут в этом же процессе и знают, с кем идёт разговор.
+    # Без контекста (проверка лимитов, служебные запуски) их просто нет.
+    servers: dict[str, Any] = {}
+    if tools_context is not None:
+        servers[agent_tools.SERVER_NAME] = agent_tools.build_server(tools_context)
+
     return ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         tools=TOOLS,
-        allowed_tools=TOOLS,
+        allowed_tools=ALLOWED_TOOLS if servers else TOOLS,
+        mcp_servers=servers,
+        # Никаких чужих MCP-серверов из настроек машины — только наш.
+        strict_mcp_config=True,
         disallowed_tools=["Bash", "Write", "Edit", "NotebookEdit", "Task"],
         # Всё, чего нет в tools, отклоняется молча: спрашивать человека в
         # переписке всё равно некого. Пути для Read проверяет хук ниже.
@@ -343,9 +378,12 @@ async def run_turn(
     model: str | None,
     max_turns: int,
     on_tool: Callable[[str], Awaitable[None]] | None = None,
+    tools_context: agent_tools.ToolContext | None = None,
 ) -> TurnResult:
     """Прогоняет один вопрос через агента и возвращает готовый ответ."""
-    options = _build_options(cwd=cwd, resume=resume, model=model, max_turns=max_turns)
+    options = _build_options(
+        cwd=cwd, resume=resume, model=model, max_turns=max_turns, tools_context=tools_context
+    )
 
     collected: list[str] = []
     session_id: str | None = None
