@@ -1,5 +1,13 @@
 # vk_claude_bot
 
+> **In English.** A personal assistant that brings Claude Code into VK (VKontakte) direct messages: you text the bot from your phone, and the reply comes back in the same chat.
+>
+> - **Capabilities:** conversation memory per chat, web search and page reading, a headless Chromium browser for screenshots of pages, sending images and files back to the chat, reading attached photos, documents, forwarded messages and wall reposts, wine ratings from Vivino.
+> - **Architecture:** VK Bots Long Poll → Python bot in Docker on a VPS → Claude Agent SDK (session resume per chat) → `messages.send`.
+> - **Security model:** only user IDs from an allowlist (`ALLOWED_USER_IDS`) are served. The agent gets an explicit tool whitelist, and a guard hook rejects anything else. There are no shell or file-write tools (`Bash`, `Write`, `Edit` are disallowed). The container has capped memory, CPU and PIDs, dropped capabilities and `no-new-privileges`. All outgoing requests by agent-chosen URLs, including redirects and browser subresources, are checked against private and internal addresses (SSRF blocking).
+>
+> The rest of this README is in Russian.
+
 Личный ассистент на Claude, доступный из переписки ВКонтакте. Пишешь боту с
 телефона — сообщение уходит на сервер, там его обрабатывает Claude Code, ответ
 возвращается в тот же диалог.
