@@ -17,7 +17,7 @@ from typing import Any
 import aiohttp
 
 from . import agent_tools, claude_runner, formatting
-from .config import Config, ConfigError, load_config
+from .config import MESSAGE_LIMIT, Config, ConfigError, load_config
 from .http import make_session
 from .media import MediaStore, MessagePart
 from .sessions import SessionStore
@@ -27,9 +27,11 @@ log = logging.getLogger("vk_claude_bot")
 
 # Как часто обновлять индикатор «печатает» (ВК гасит его примерно через 10 с).
 TYPING_INTERVAL = 5.0
-# Не чаще одного сообщения о прогрессе в эти секунды и не больше лимита за ход.
+# Не чаще одной правки заметки о ходе работы в эти секунды и не больше строк
+# в ней за ход. Заметка одна на весь ход, поэтому строк можно больше, чем было
+# отдельных сообщений: чат от них не разъезжается.
 PROGRESS_MIN_INTERVAL = 3.0
-PROGRESS_MAX_PER_TURN = 12
+PROGRESS_MAX_PER_TURN = 20
 
 HELP_TEXT = """\
 Просто напиши вопрос — отвечу. Можно кидать фото и документы, я их посмотрю.
@@ -228,6 +230,7 @@ class PeerWorker:
             await self._say(self.peer_id, "Не смог скачать вложения — ВК не отдаёт файлы.")
             return
         prompt = _build_prompt(messages)
+        files = _attached_files(messages)
 
         stored = bot.sessions.get(self.peer_id)
         if stored is not None and stored.age_hours() > bot.config.session_ttl_hours:
@@ -261,11 +264,13 @@ class PeerWorker:
                     max_turns=bot.config.max_turns,
                     on_tool=progress.report if bot.config.show_tool_progress else None,
                     tools_context=tools_context,
+                    expect_files=files,
                 ),
                 timeout=TURN_TIMEOUT,
             )
         except asyncio.TimeoutError:
             log.warning("Ход для %s не уложился в %s с — прерываю", self.peer_id, TURN_TIMEOUT)
+            await progress.finish()
             await self._say(
                 self.peer_id,
                 f"Не уложился в {TURN_TIMEOUT // 60} минут и прервался. "
@@ -277,14 +282,77 @@ class PeerWorker:
             bot.sessions.remember(self.peer_id, result.session_id)
         alerts = bot.remember_limits(result.rate_limits)
 
+        retry = await self._insist_on_files(result, tools_context, progress)
+        if retry is not None:
+            result = retry
+            if result.session_id:
+                bot.sessions.remember(self.peer_id, result.session_id)
+            alerts += bot.remember_limits(result.rate_limits)
+
+        # Ответ — всегда новое сообщение, следом за заметкой о ходе работы.
+        await progress.finish()
         await bot.reply(self.peer_id, result.text)
         for alert in alerts:
             await bot.reply(self.peer_id, alert)
         if result.cost_usd:
             log.info("Ход для %s стоил $%.4f", self.peer_id, result.cost_usd)
 
+    async def _insist_on_files(
+        self,
+        result: claude_runner.TurnResult,
+        tools_context: agent_tools.ToolContext,
+        progress: "_ProgressReporter",
+    ) -> claude_runner.TurnResult | None:
+        """Второй заход, если агент ответил, не открыв часть присланных файлов.
+
+        Ответ по одной фотографии из четырёх ничем не отличается от обычного:
+        он связный, уверенный и по существу — заметить подмену может только
+        человек, который знает, что было на остальных трёх. Поэтому проверяет
+        не промпт, а код: `run_turn` считает вызовы Read по присланным путям, и
+        если что-то осталось неоткрытым, ход переигрывается один раз. Один, а
+        не до победного: упрямый отказ смотреть файл не должен жечь лимиты.
+        """
+        bot = self._bot
+        if not result.unread_files or result.is_error or not result.session_id:
+            return None
+
+        names = ", ".join(path.name for path in result.unread_files)
+        log.warning("Прошу агента досмотреть файлы для %s: %s", self.peer_id, names)
+        await progress.report("🔁 Досматриваю остальные файлы")
+
+        paths = "\n".join(str(path) for path in result.unread_files)
+        prompt = (
+            "Стоп. Ты ответил, не открыв присланные файлы — вот они:\n"
+            f"{paths}\n"
+            "Открой инструментом Read каждый, отдельным вызовом, и ответь на исходный "
+            "вопрос заново, целиком, с учётом всего, что на них. Про саму заминку "
+            "человеку не рассказывай: он её не видел, ему нужен ответ."
+        )
+        try:
+            retry = await asyncio.wait_for(
+                claude_runner.run_turn(
+                    prompt=prompt,
+                    cwd=bot.config.workspace,
+                    resume=result.session_id,
+                    model=bot.config.claude_model,
+                    max_turns=bot.config.max_turns,
+                    on_tool=progress.report if bot.config.show_tool_progress else None,
+                    tools_context=tools_context,
+                    expect_files=list(result.unread_files),
+                ),
+                timeout=TURN_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("Второй заход за файлами для %s не уложился в срок", self.peer_id)
+            return None
+        if retry.is_error:
+            log.warning("Второй заход за файлами для %s не удался", self.peer_id)
+            return None
+        return retry
+
     async def _collect(self, jobs: list[Job]) -> list[list[MessagePart]]:
         """Разбирает все собранные сообщения, деля один бюджет на вложения."""
+        await self._refresh(jobs)
         budget = self._bot.media.new_budget()
         return [
             await self._bot.media.collect_parts(
@@ -293,26 +361,99 @@ class PeerWorker:
             for job in jobs
         ]
 
+    async def _refresh(self, jobs: list[Job]) -> None:
+        """Перечитывает сообщения через API перед разбором вложений.
+
+        Событие Long Poll приходит в момент создания сообщения, а вложения ВК
+        досоединяет к нему следом: из четырёх приложенных фотографий в событии
+        лежала одна, и бот честно смотрел ровно её. Никакая формулировка в
+        промпте это не чинит — остальных трёх он просто не видел. `getById`
+        отдаёт сообщение таким, какое оно сейчас, со всеми вложениями.
+
+        Свои поля события при этом сохраняются: то, чего в ответе API не
+        оказалось (например, `reply_message`), берётся из исходного события.
+        """
+        ids = [job.message_id for job in jobs if job.message_id]
+        if not ids:
+            return
+        try:
+            fresh = await self._bot.vk.get_messages(ids)
+        except Exception as exc:  # noqa: BLE001 — не смогли перечитать, идём с тем, что есть
+            log.warning("Не удалось перечитать сообщения %s: %s", ids, exc)
+            return
+
+        by_id = {int(item.get("id", 0)): item for item in fresh}
+        for job in jobs:
+            actual = by_id.get(job.message_id)
+            if not actual:
+                continue
+            before = len(job.message.get("attachments") or [])
+            after = len(actual.get("attachments") or [])
+            job.message = {**job.message, **actual}
+            if before != after:
+                log.info(
+                    "Сообщение %s: в событии вложений %s, в API %s",
+                    job.message_id,
+                    before,
+                    after,
+                )
+
 
 class _ProgressReporter:
-    """Шлёт в чат короткие заметки о вызовах инструментов, не заспамливая его."""
+    """Показывает ход работы одним сообщением, дописывая в него строки.
+
+    Раньше каждый шаг уезжал отдельным сообщением, и один вопрос превращался в
+    десяток уведомлений подряд — ответ терялся среди них. Теперь все шаги живут
+    в одном сообщении, которое правится на месте, а ответ приходит следующим за
+    ним: его видно.
+    """
 
     def __init__(self, bot: "Bot", peer_id: int) -> None:
         self._bot = bot
         self._peer_id = peer_id
+        self._lines: list[str] = []
+        self._message_id: int | None = None
+        # Сколько строк уже показано: по нему видно, нужна ли правка вообще.
+        self._shown = 0
         self._last_at = 0.0
-        self._sent = 0
 
     async def report(self, note: str) -> None:
-        now = time.monotonic()
-        if self._sent >= PROGRESS_MAX_PER_TURN:
+        if len(self._lines) >= PROGRESS_MAX_PER_TURN:
             return
-        if now - self._last_at < PROGRESS_MIN_INTERVAL:
+        self._lines.append(note)
+        # Слишком частые правки — тот же флуд, только в API. Строка при этом не
+        # теряется: она уедет со следующей правкой или при finish().
+        if time.monotonic() - self._last_at < PROGRESS_MIN_INTERVAL:
             return
-        self._last_at = now
-        self._sent += 1
-        with contextlib.suppress(Exception):
-            await self._bot.vk.send_message(self._peer_id, note)
+        await self._flush()
+
+    async def finish(self) -> None:
+        """Дописывает шаги, не успевшие показаться до ответа."""
+        await self._flush()
+
+    def _render(self) -> str:
+        """Строки одним сообщением; старые отбрасываются, если не влезают."""
+        lines = list(self._lines)
+        while len(lines) > 1 and sum(len(one) + 1 for one in lines) > MESSAGE_LIMIT:
+            lines.pop(0)
+        text = "\n".join(lines)
+        if len(lines) < len(self._lines):
+            text = "…\n" + text
+        return text[:MESSAGE_LIMIT]
+
+    async def _flush(self) -> None:
+        if self._shown == len(self._lines):
+            return
+        self._last_at = time.monotonic()
+        self._shown = len(self._lines)
+        text = self._render()
+        try:
+            if self._message_id is None:
+                self._message_id = await self._bot.vk.send_message(self._peer_id, text)
+            else:
+                await self._bot.vk.edit_message(self._peer_id, self._message_id, text)
+        except Exception as exc:  # noqa: BLE001 — заметка о ходе не стоит сорванного ответа
+            log.warning("Не удалось показать ход работы в %s: %s", self._peer_id, exc)
 
 
 class Bot:
@@ -651,6 +792,17 @@ class Bot:
                 await task
         for worker in self._workers.values():
             await worker.close()
+
+
+def _attached_files(messages: list[list[MessagePart]]) -> list[Path]:
+    """Скачанные вложения всех собранных сообщений — в порядке промпта."""
+    return [
+        item.path
+        for parts in messages
+        for part in parts
+        for item in part.attachments
+        if item.path is not None
+    ]
 
 
 def _build_prompt(messages: list[list[MessagePart]]) -> str:

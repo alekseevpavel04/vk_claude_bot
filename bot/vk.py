@@ -83,14 +83,40 @@ class VkClient:
 
     async def send_message(
         self, peer_id: int, text: str, attachment: str | None = None
-    ) -> None:
-        await self.call(
-            "messages.send",
-            peer_id=peer_id,
-            message=text,
-            attachment=attachment,
-            random_id=random.getrandbits(31),
+    ) -> int:
+        """Отправляет сообщение и возвращает его id — его можно потом править."""
+        return int(
+            await self.call(
+                "messages.send",
+                peer_id=peer_id,
+                message=text,
+                attachment=attachment,
+                random_id=random.getrandbits(31),
+            )
         )
+
+    async def edit_message(self, peer_id: int, message_id: int, text: str) -> None:
+        """Переписывает уже отправленное сообщение.
+
+        Правкой живёт заметка о ходе работы: десяток шагов одним сообщением,
+        а не десятком уведомлений подряд. ВК разрешает править своё сообщение
+        сутки и не ругается, если текст не изменился.
+        """
+        await self.call(
+            "messages.edit",
+            peer_id=peer_id,
+            message_id=message_id,
+            message=text,
+        )
+
+    async def get_messages(self, message_ids: list[int]) -> list[dict[str, Any]]:
+        """Перечитывает сообщения по id — со всеми вложениями, какие есть сейчас."""
+        response = await self.call(
+            "messages.getById",
+            message_ids=",".join(str(one) for one in message_ids),
+        )
+        items = response.get("items") or []
+        return [item for item in items if isinstance(item, dict)]
 
     # --- отправка файлов -------------------------------------------------
     #

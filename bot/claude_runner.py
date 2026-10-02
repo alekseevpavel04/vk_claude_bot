@@ -125,10 +125,14 @@ SYSTEM_PROMPT = """\
   недоступно, и попроси написать текстом.
 - Read — читает присланные файлы и фотографии, пути к ним указаны в сообщении.
   Читай их ВСЕ, каждый отдельным вызовом, и только потом отвечай. Сколько файлов
-  приложено, написано в сообщении числом — сверься с ним. Это твоя самая частая
-  ошибка: человек прикладывает четыре фотографии, ты смотришь первую и отвечаешь
-  по ней, а про остальные три говоришь так, будто их видел. Прикинуть по первому
-  файлу, что на других, нельзя — фотографии разные.
+  приложено, написано в сообщении числом — сверься с ним. Прикинуть по первому
+  файлу, что на других, нельзя: фотографии разные.
+  Картинки живут в памяти недолго: через ход-другой снимки из неё пропадают, а
+  твой текст про них остаётся. Это устройство памяти, а не твоя оплошность, и
+  знать задним числом, сколько файлов ты открыл, ты не можешь — не сочиняй
+  таких отчётов и не объявляй свои прежние выводы выдумкой лишь потому, что
+  картинки перед глазами больше нет. Нужно свериться с присланным фото ещё раз
+  — открой файл инструментом Read заново, он никуда не делся.
   ВАЖНО про его формат: текстовые файлы Read показывает с номерами строк слева,
   в виде «     5→содержимое строки». Номер и стрелку дорисовывает сам инструмент,
   в файле их нет. Никогда не принимай их за содержимое: если в файле числа, то
@@ -139,7 +143,9 @@ SYSTEM_PROMPT = """\
 Про вино. Рейтинг не бери из памяти — только wine_search: память тут врёт
 уверенно и мимо. С фотографии читай этикетку целиком: производитель, название,
 сорт, год. Если на фото несколько бутылок или фотографий пришло несколько —
-собери все названия и передай их ОДНИМ вызовом списком. Просят проверить все —
+собери все названия и передай их ОДНИМ вызовом списком. Иди по полке подряд,
+слева направо и сверху вниз, и так по каждой фотографии: пропущенная бутылка
+для человека выглядит как «её там не было». Просят проверить все —
 значит все, без «самых интересных». Названия пиши латиницей, как на этикетке.
 На каждое название Vivino отдаёт несколько кандидатов: бери тот, чьё имя
 действительно совпадает с этикеткой, а если ничего не совпало — так и скажи,
@@ -172,6 +178,8 @@ class TurnResult:
     cost_usd: float | None
     # Состояние лимитов подписки, если API его прислало по ходу запроса.
     rate_limits: dict[str, RateLimitInfo] = field(default_factory=dict)
+    # Присланные файлы, которые агент так и не открыл инструментом Read.
+    unread_files: list[Path] = field(default_factory=list)
 
 
 def describe_tool(block: ToolUseBlock) -> str | None:
@@ -379,8 +387,15 @@ async def run_turn(
     max_turns: int,
     on_tool: Callable[[str], Awaitable[None]] | None = None,
     tools_context: agent_tools.ToolContext | None = None,
+    expect_files: list[Path] | None = None,
 ) -> TurnResult:
-    """Прогоняет один вопрос через агента и возвращает готовый ответ."""
+    """Прогоняет один вопрос через агента и возвращает готовый ответ.
+
+    `expect_files` — присланные вложения, которые агент обязан открыть. Что из
+    них он не открыл, возвращается в `unread_files`: «ответил по первому фото из
+    четырёх» иначе выглядит как обычный ответ, и заметить это может только
+    человек, который знает, что было на остальных.
+    """
     options = _build_options(
         cwd=cwd, resume=resume, model=model, max_turns=max_turns, tools_context=tools_context
     )
@@ -392,6 +407,10 @@ async def run_turn(
     result_text: str | None = None
     fatal: str | None = None
     limits: dict[str, RateLimitInfo] = {}
+    # Имена, а не пути: агент зовёт Read тем путём, который увидел в промпте,
+    # и сверять достаточно имя файла — оно уникально по построению.
+    awaited = {path.name: path for path in expect_files or []}
+    opened: set[str] = set()
 
     try:
         async for message in query(prompt=_as_stream(prompt), options=options):
@@ -404,10 +423,15 @@ async def run_turn(
                 for block in message.content:
                     if isinstance(block, TextBlock) and block.text.strip():
                         collected.append(block.text.strip())
-                    elif isinstance(block, ToolUseBlock) and on_tool is not None:
-                        note = describe_tool(block)
-                        if note:
-                            await on_tool(note)
+                    elif isinstance(block, ToolUseBlock):
+                        if block.name == "Read":
+                            target = block.input.get("file_path")
+                            if isinstance(target, str):
+                                opened.add(Path(target).name)
+                        if on_tool is not None:
+                            note = describe_tool(block)
+                            if note:
+                                await on_tool(note)
             elif isinstance(message, ResultMessage):
                 session_id = message.session_id
                 cost = message.total_cost_usd
@@ -459,8 +483,15 @@ async def run_turn(
         )
         is_error = True
 
+    unread = [path for name, path in awaited.items() if name not in opened]
+    if unread:
+        log.warning(
+            "Агент не открыл присланные файлы: %s", ", ".join(path.name for path in unread)
+        )
+
     return TurnResult(
-        text=text, session_id=session_id, is_error=is_error, cost_usd=cost, rate_limits=limits
+        text=text, session_id=session_id, is_error=is_error, cost_usd=cost,
+        rate_limits=limits, unread_files=unread,
     )
 
 
