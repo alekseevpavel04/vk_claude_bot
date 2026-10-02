@@ -25,6 +25,7 @@ from claude_agent_sdk import (
     RateLimitEvent,
     RateLimitInfo,
     ResultMessage,
+    SystemMessage,
     TextBlock,
     ToolUseBlock,
     delete_session,
@@ -325,6 +326,7 @@ def _build_options(
     model: str | None,
     max_turns: int,
     tools_context: agent_tools.ToolContext | None = None,
+    compact_percent: int = 0,
 ) -> ClaudeAgentOptions:
     # SDK передаёт подпроцессу всё окружение бота и накрывает его этим словарём.
     # Убрать ключ насовсем нельзя — только перекрыть, поэтому затираем пустым.
@@ -334,6 +336,11 @@ def _build_options(
     token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    # Порог автосжатия считается от рабочего окна модели: у Sonnet 5 это
+    # миллион токенов без запаса на ответ, и 20% выходят около 196 тыс. Сам CLI
+    # сжимает только у самого потолка, а разговор у нас один и длится неделями.
+    if compact_percent > 0:
+        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(compact_percent)
 
     # Свои инструменты живут в этом же процессе и знают, с кем идёт разговор.
     # Без контекста (проверка лимитов, служебные запуски) их просто нет.
@@ -368,6 +375,27 @@ def _build_options(
     )
 
 
+async def _note_compaction(
+    message: SystemMessage, on_tool: Callable[[str], Awaitable[None]] | None
+) -> None:
+    """Сжатие истории занимает до минуты, и без строчки в ходе работы это
+    выглядит как зависание. В лог — сколько было до сжатия, чтобы порог можно
+    было проверить по факту, а не по документации."""
+    if message.subtype == "status" and message.data.get("status") == "compacting":
+        if on_tool is not None:
+            await on_tool("Сжимаю историю разговора")
+    elif message.subtype == "status" and message.data.get("compact_result") == "failed":
+        # На коротком разговоре CLI отказывается сам (too_few_groups) — это
+        # норма. На длинном отказ значит, что история дальше растёт без сжатия.
+        log.warning("Сжать историю не вышло: %s", message.data.get("compact_error"))
+    elif message.subtype == "compact_boundary":
+        meta = message.data.get("compact_metadata") or {}
+        log.info(
+            "История разговора сжата (%s): было %s токенов",
+            meta.get("trigger", "?"), meta.get("pre_tokens", "?"),
+        )
+
+
 async def _as_stream(text: str) -> AsyncIterator[dict[str, Any]]:
     """Один вопрос, поданный потоком.
 
@@ -388,6 +416,7 @@ async def run_turn(
     on_tool: Callable[[str], Awaitable[None]] | None = None,
     tools_context: agent_tools.ToolContext | None = None,
     expect_files: list[Path] | None = None,
+    compact_percent: int = 0,
 ) -> TurnResult:
     """Прогоняет один вопрос через агента и возвращает готовый ответ.
 
@@ -397,7 +426,8 @@ async def run_turn(
     человек, который знает, что было на остальных.
     """
     options = _build_options(
-        cwd=cwd, resume=resume, model=model, max_turns=max_turns, tools_context=tools_context
+        cwd=cwd, resume=resume, model=model, max_turns=max_turns,
+        tools_context=tools_context, compact_percent=compact_percent,
     )
 
     collected: list[str] = []
@@ -417,6 +447,8 @@ async def run_turn(
             if isinstance(message, RateLimitEvent):
                 info = message.rate_limit_info
                 limits[info.rate_limit_type or "unknown"] = info
+            elif isinstance(message, SystemMessage):
+                await _note_compaction(message, on_tool)
             elif isinstance(message, AssistantMessage):
                 if message.error:
                     fatal = _explain_error(message.error)

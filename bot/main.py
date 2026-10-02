@@ -265,6 +265,7 @@ class PeerWorker:
                     on_tool=progress.report if bot.config.show_tool_progress else None,
                     tools_context=tools_context,
                     expect_files=files,
+                    compact_percent=bot.config.autocompact_percent,
                 ),
                 timeout=TURN_TIMEOUT,
             )
@@ -339,6 +340,7 @@ class PeerWorker:
                     on_tool=progress.report if bot.config.show_tool_progress else None,
                     tools_context=tools_context,
                     expect_files=list(result.unread_files),
+                    compact_percent=bot.config.autocompact_percent,
                 ),
                 timeout=TURN_TIMEOUT,
             )
