@@ -336,7 +336,7 @@ def _build_options(
     token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
-    # Порог автосжатия считается от рабочего окна модели: у Sonnet 5 это
+    # Порог автосжатия считается от рабочего окна модели: у Sonnet и Opus 5.x это
     # миллион токенов без запаса на ответ, и 20% выходят около 196 тыс. Сам CLI
     # сжимает только у самого потолка, а разговор у нас один и длится неделями.
     if compact_percent > 0:
