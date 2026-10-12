@@ -41,6 +41,16 @@ User-Agent берётся у самого браузера (Browser.getVersion) 
 во внутреннюю сеть (метаданные облака, соседи по хосту) не пускаем никого —
 ни саму страницу, ни её картинки, ни редиректы. Проверять только адрес, который
 попросил агент, недостаточно: перенаправление увело бы браузер куда угодно.
+Новые окна страница открыть не может: у нового окна свой поток запросов, мимо
+нашей проверки, поэтому оно закрывается раньше, чем успеет что-то загрузить.
+
+Действия. Агент может не только смотреть, но и нажимать: кнопку, вкладку
+«Состав», «Показать ещё», ввести запрос в поиск сайта и нажать Enter. Браузер
+между вызовами при этом не живёт — память важнее, — так что агент передаёт весь
+путь от адреса целиком, и каждый вызов проигрывает его заново. Нажатия идут
+настоящими событиями мыши и клавиатуры (Input.dispatch*), а не el.click():
+часть сайтов на синтетический клик не реагирует. Профиль браузера каждый раз
+чистый, войти куда-то от имени человека нечем.
 """
 
 from __future__ import annotations
@@ -185,6 +195,92 @@ _STEALTH_JS = """
 # Один браузер за раз на весь процесс.
 _LOCK = asyncio.Lock()
 
+# Действия на странице. Десяти хватает на «поиск, фильтр, вкладка, ещё»;
+# длиннее путь — уже повод открыть нужный адрес напрямую.
+MAX_ACTIONS = 10
+ACTION_KINDS = ("click", "type", "press", "select", "scroll", "wait")
+# Сколько ждать загрузку, которую запустило действие (переход, поиск).
+ACTION_NAV_WAIT = 15.0
+# Пауза после каждого действия: выдачу и вкладки сайты часто дорисовывают
+# скриптом, без перехода на новую страницу.
+ACTION_SETTLE = 1.2
+MAX_WAIT = 10.0
+
+# Клавиши, которые можно нажать: имя, код, символ для keypress.
+_KEYS = {
+    "enter": ("Enter", 13, "\r"),
+    "escape": ("Escape", 27, ""),
+    "esc": ("Escape", 27, ""),
+    "tab": ("Tab", 9, ""),
+    "arrowdown": ("ArrowDown", 40, ""),
+    "arrowup": ("ArrowUp", 38, ""),
+    "pagedown": ("PageDown", 34, ""),
+    "pageup": ("PageUp", 33, ""),
+    "backspace": ("Backspace", 8, ""),
+    "space": (" ", 32, " "),
+}
+
+
+@dataclass(frozen=True)
+class Action:
+    kind: str
+    target: str = ""
+    text: str = ""
+    seconds: float = 0.0
+
+
+class _ActionFailed(Exception):
+    """Действие не выполнить: нет такого элемента, пункта, клавиши."""
+
+
+def _key(name: str) -> tuple[str, int, str] | None:
+    return _KEYS.get(re.sub(r"[\s_-]", "", name).lower())
+
+
+def parse_actions(raw: Any) -> list[Action]:
+    """Разбирает действия от агента. Ошибка — ValueError с текстом для агента."""
+    if isinstance(raw, str):
+        # Модель иногда присылает список строкой JSON.
+        try:
+            raw = json.loads(raw) if raw.strip() else []
+        except ValueError:
+            raise ValueError("actions должен быть списком объектов, а пришла строка.") from None
+    if not raw:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError("actions должен быть списком действий.")
+    if len(raw) > MAX_ACTIONS:
+        raise ValueError(f"Не больше {MAX_ACTIONS} действий за вызов.")
+
+    actions = []
+    for index, item in enumerate(raw, 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Действие {index}: нужен объект с полем do.")
+        kind = str(item.get("do") or "").strip().lower()
+        target = str(item.get("target") or "").strip()
+        text = str(item.get("text") or "")
+        try:
+            seconds = float(item.get("seconds") or 0)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if kind not in ACTION_KINDS:
+            raise ValueError(
+                f"Действие {index}: неизвестное do={kind!r}, бывают {', '.join(ACTION_KINDS)}."
+            )
+        if kind in ("click", "select") and not target:
+            raise ValueError(f"Действие {index}: для {kind} нужен target.")
+        if kind in ("type", "select") and not text:
+            raise ValueError(f"Действие {index}: для {kind} нужен text.")
+        if kind == "press" and _key(text) is None:
+            raise ValueError(
+                f"Действие {index}: клавиша {text!r} не поддерживается, бывают "
+                "Enter, Escape, Tab, ArrowDown, ArrowUp, PageDown, PageUp, Backspace, Space."
+            )
+        actions.append(Action(kind, target[:200], text[:500], max(0.0, min(seconds, MAX_WAIT))))
+    return actions
+
 
 @dataclass(frozen=True)
 class PageImage:
@@ -210,6 +306,9 @@ class Rendered:
     # С какой высоты начат снимок и сколько снято — для длинных страниц.
     shot_from: int = 0
     shot_to: int = 0
+    # Что сделано на странице по просьбе агента, строкой на действие.
+    actions_done: list[str] = field(default_factory=list)
+    actions_ok: bool = True
 
 
 def find_chromium() -> str | None:
@@ -272,10 +371,14 @@ class _Cdp:
                     future.set_result(data.get("params") or {})
             handler = self._handlers.get(event)
             if handler is not None:
+                params = data.get("params") or {}
+                # Чья это вкладка: события всех подключённых вкладок идут одним
+                # потоком. Ключ свой — у части событий есть собственный sessionId.
+                params["__session"] = data.get("sessionId")
                 # Обработчик может ходить в сеть (проверка адреса резолвит имя),
                 # а цикл чтения останавливать нельзя: в нём же приходят ответы
                 # на команды, которых обработчик и ждёт.
-                asyncio.create_task(handler(data.get("params") or {}))
+                asyncio.create_task(handler(params))
 
     async def send(
         self, method: str, params: dict[str, Any] | None = None,
@@ -338,6 +441,135 @@ _EXTRACT_JS = """
     height: Math.max(document.body ? document.body.scrollHeight : 0,
                      document.documentElement ? document.documentElement.scrollHeight : 0),
   };
+})()
+"""
+
+# Найти элемент для действия. mode: click — то, на что нажимают; input — поле
+# ввода; select — выпадающий список. target — видимый текст, подпись,
+# placeholder или CSS-селектор с приставкой «css:». Найденный элемент
+# прокручивается в середину экрана и запоминается в window.__vkbotTarget.
+_LOCATE_JS = r"""
+(mode, target) => {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+  };
+  const editable = (el) => el && (el.isContentEditable || /^(input|textarea)$/i.test(el.tagName));
+  const names = (el) => {
+    const forLabel = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
+    return [
+      el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('title'),
+      el.getAttribute('alt'), el.getAttribute('name'),
+      forLabel ? forLabel.innerText : '', el.closest('label') ? el.closest('label').innerText : '',
+      /^(submit|button)$/i.test(el.type || '') ? el.value : '',
+      el.innerText,
+    ].filter(Boolean).map(norm);
+  };
+  const pools = {
+    input: 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=checkbox])' +
+           ':not([type=radio]):not([type=file]), textarea, [contenteditable=""], [contenteditable=true],' +
+           ' [role=searchbox], [role=textbox], [role=combobox]',
+    select: 'select',
+    click: 'a, button, [role=button], [role=link], [role=tab], [role=menuitem], [role=option],' +
+           ' [role=checkbox], [role=radio], [role=switch], input[type=submit], input[type=button],' +
+           ' input[type=checkbox], input[type=radio], label, summary, [onclick], [tabindex]',
+  };
+  const pool = pools[mode] || pools.click;
+  const wanted = norm(target);
+  let found = null;
+  if (wanted.startsWith('css:')) {
+    try {
+      found = Array.from(document.querySelectorAll(target.trim().slice(4))).find(visible) || null;
+    } catch (e) { return {error: 'неверный CSS-селектор'}; }
+  } else if (!wanted) {
+    const active = document.activeElement;
+    found = (editable(active) && visible(active)) ? active : (Array.from(document.querySelectorAll(
+      'input[type=search], [role=searchbox], input[type=text], input:not([type]), textarea'
+    )).find(visible) || null);
+  } else {
+    // Точное совпадение лучше начала, начало лучше вхождения; при равенстве
+    // берём вложенный элемент — у обёртки текст длиннее и случайнее.
+    let best = 0;
+    for (const el of document.querySelectorAll(pool)) {
+      if (!visible(el)) continue;
+      const all = names(el);
+      const score = all.some((x) => x === wanted) ? 3
+        : all.some((x) => x.startsWith(wanted)) ? 2
+        : all.some((x) => x.includes(wanted)) ? 1 : 0;
+      if (score > best || (score && score === best && found && found.contains(el))) {
+        best = score;
+        found = el;
+      }
+    }
+    if (!found && mode === 'click') {
+      // Вкладки и кнопки, свёрстанные голыми div без роли: элемент ровно с
+      // таким текстом, самый вложенный (потомки идут в документе после предков).
+      const exact = Array.from(document.querySelectorAll('body *'))
+        .filter((el) => norm(el.textContent) === wanted && visible(el));
+      found = exact.length ? exact[exact.length - 1] : null;
+    }
+  }
+  if (!found) return null;
+  found.scrollIntoView({block: 'center', inline: 'center'});
+  window.__vkbotTarget = found;
+  const r = found.getBoundingClientRect();
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  const hit = document.elementFromPoint(x, y);
+  const label = (norm(found.innerText) || names(found)[0] || '').slice(0, 60);
+  return {
+    x: x, y: y, top: Math.round(r.top + window.scrollY),
+    covered: !!hit && hit !== found && !found.contains(hit) && !hit.contains(found),
+    desc: found.tagName.toLowerCase() + (label ? ' «' + label + '»' : ''),
+  };
+}
+"""
+
+# Поле, куда вводить: то, что получило фокус после нажатия (поиск на сайтах
+# часто открывается отдельным полем поверх), иначе найденное. Старое
+# содержимое выделяется, чтобы ввод его заменил, а не дописался в хвост.
+_FOCUS_INPUT_JS = r"""
+(() => {
+  const editable = (el) => el && (el.isContentEditable || /^(input|textarea)$/i.test(el.tagName));
+  let el = document.activeElement;
+  if (!editable(el)) { el = window.__vkbotTarget; if (el) el.focus(); }
+  if (!el) return false;
+  if (typeof el.select === 'function') el.select();
+  else if (el.isContentEditable) document.execCommand('selectAll');
+  return true;
+})()
+"""
+
+_SELECT_OPTION_JS = r"""
+(wanted) => {
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const el = window.__vkbotTarget;
+  if (!el || !el.options) return null;
+  const t = norm(wanted);
+  const options = Array.from(el.options);
+  const option = options.find((o) => norm(o.text) === t) || options.find((o) => norm(o.text).includes(t));
+  if (!option) return null;
+  el.value = option.value;
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  return option.text.trim();
+}
+"""
+
+# Ссылки с target=_blank и window.open ведём в эту же вкладку: новое окно всё
+# равно закрывается (см. on_attached), и без этого клик «в никуда».
+_SAME_TAB_JS = r"""
+(() => {
+  if (window.__vkbotSameTab) return 0;
+  window.__vkbotSameTab = 1;
+  window.open = function (u) { if (u) location.href = new URL(u, location.href).href; return window; };
+  document.addEventListener('click', (e) => {
+    const a = e.target && e.target.closest ? e.target.closest('a[target], form[target]') : null;
+    if (a) a.removeAttribute('target');
+  }, true);
+  return 0;
 })()
 """
 
@@ -457,12 +689,14 @@ async def render(
     want_details: bool = True,
     load_timeout: float = 30.0,
     settle: float = 1.5,
+    actions: list[Action] | None = None,
 ) -> Rendered:
     """Открывает страницу и возвращает всё, что с неё удалось снять.
 
     shots: сколько снимков экрана сохранить (0 — не снимать).
     full_page: снимать не только первый экран, но и то, что ниже.
     start_at: с какой высоты начинать снимок — чтобы досмотреть длинную страницу.
+    actions: что сделать на странице перед тем, как снимать (parse_actions).
     """
     binary = find_chromium()
     if binary is None:
@@ -474,7 +708,7 @@ async def render(
         return await _render(
             binary, url, out_dir=out_dir, prefix=prefix, shots=shots,
             full_page=full_page, start_at=start_at, want_details=want_details,
-            load_timeout=load_timeout, settle=settle,
+            load_timeout=load_timeout, settle=settle, actions=actions or [],
         )
 
 
@@ -490,6 +724,7 @@ async def _render(
     want_details: bool,
     load_timeout: float,
     settle: float,
+    actions: list[Action],
 ) -> Rendered:
     user_data_dir = Path(tempfile.mkdtemp(prefix="vkbot-chrome-"))
     process = await asyncio.create_subprocess_exec(
@@ -517,6 +752,36 @@ async def _render(
             "Target.attachToTarget", {"targetId": target["targetId"], "flatten": True}
         )
         sid = attached["sessionId"]
+        main_target = target["targetId"]
+
+        # Новое окно (window.open, ссылка в новой вкладке) — отдельная страница
+        # со своими запросами, которые проверка основной вкладки не видит. Через
+        # такое окно страница добралась бы до внутренней сети в обход неё.
+        # Поэтому новые страницы подключаются остановленными, все их запросы
+        # получают отказ (см. on_paused), и только потом окно запускается и
+        # закрывается. Просто закрыть остановленное нельзя: открывшая его
+        # страница ждёт ответа window.open и висит вместе с нажатием (замерено,
+        # 30 секунд до таймаута). Воркеры сервисов остаются остановленными:
+        # для отрисовки они не нужны, а их запросы тоже шли бы мимо проверки.
+        async def on_attached(params: dict[str, Any]) -> None:
+            info = params.get("targetInfo") or {}
+            child = params.get("sessionId")
+            if info.get("targetId") == main_target or info.get("type") != "page" or not child:
+                return
+            log.info("Страница открывала новое окно — закрыто: %s", str(info.get("url"))[:100])
+            with contextlib.suppress(Exception):
+                await cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*"}]}, session_id=child, timeout=10)
+                await cdp.send("Runtime.runIfWaitingForDebugger", session_id=child, timeout=10)
+                await cdp.send("Target.closeTarget", {"targetId": info.get("targetId")}, timeout=10)
+
+        cdp.on("Target.attachedToTarget", on_attached)
+        await cdp.send(
+            "Target.setAutoAttach",
+            {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True},
+        )
+        # Скачивания некуда и незачем класть: диск общий с VPN.
+        with contextlib.suppress(Exception):
+            await cdp.send("Browser.setDownloadBehavior", {"behavior": "deny"}, timeout=10)
 
         # Кэш уже проверенных хостов. Имя отдельное, и это важно: обработчик
         # ниже держит его в замыкании и живёт до самого закрытия браузера, а
@@ -530,7 +795,16 @@ async def _render(
         async def on_paused(params: dict[str, Any]) -> None:
             request_id = params.get("requestId")
             target_url = (params.get("request") or {}).get("url") or ""
+            session = params.get("__session") or sid
             try:
+                if session != sid:
+                    # Запрос из всплывшего окна: оно закрывается, грузить ему нечего.
+                    await cdp.send(
+                        "Fetch.failRequest",
+                        {"requestId": request_id, "errorReason": "BlockedByClient"},
+                        session_id=session, timeout=10,
+                    )
+                    return
                 if params.get("resourceType") in _BLOCKED_TYPES or await _is_forbidden(target_url, checked):
                     await cdp.send(
                         "Fetch.failRequest",
@@ -544,14 +818,36 @@ async def _render(
             except Exception as exc:  # noqa: BLE001 — запрос мог отмениться сам
                 log.debug("Fetch.requestPaused (%s): %s", target_url[:80], exc)
 
+        loading = _Loading()
+
         async def on_response(params: dict[str, Any]) -> None:
-            if params.get("type") == "Document" and "code" not in status:
+            # Код последнего документа основной рамки: после нажатия агент мог
+            # уйти на другую страницу, и отказ важен именно у неё.
+            if params.get("type") == "Document" and params.get("frameId") in (loading.frame_id, None):
                 status["code"] = int((params.get("response") or {}).get("status") or 0)
+
+        async def on_started(params: dict[str, Any]) -> None:
+            if params.get("frameId") == loading.frame_id:
+                loading.idle.clear()
+
+        async def on_stopped(params: dict[str, Any]) -> None:
+            if params.get("frameId") == loading.frame_id:
+                loading.idle.set()
+
+        async def on_dialog(_params: dict[str, Any]) -> None:
+            # alert и confirm останавливают скрипты страницы, пока их не закроют.
+            with contextlib.suppress(Exception):
+                await cdp.send("Page.handleJavaScriptDialog", {"accept": True}, session_id=sid, timeout=10)
 
         cdp.on("Fetch.requestPaused", on_paused)
         cdp.on("Network.responseReceived", on_response)
+        cdp.on("Page.frameStartedLoading", on_started)
+        cdp.on("Page.frameStoppedLoading", on_stopped)
+        cdp.on("Page.javascriptDialogOpening", on_dialog)
 
         await cdp.send("Page.enable", session_id=sid)
+        tree = await cdp.send("Page.getFrameTree", session_id=sid)
+        loading.frame_id = str(((tree.get("frameTree") or {}).get("frame") or {}).get("id") or main_target)
         await cdp.send("Network.enable", session_id=sid)
         await cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*"}]}, session_id=sid)
         await cdp.send(
@@ -614,15 +910,25 @@ async def _render(
             log.info("Страница %s не досказала о загрузке — снимаю как есть", url[:80])
         await asyncio.sleep(settle)
 
-        if full_page:
-            await _scroll_through(cdp, sid)
-
         # Сайт мог показать не страницу, а «Проверяем браузер». Такие заглушки
         # сами уходят через несколько секунд — ждём настоящее содержимое, иначе
         # снимок достанется ровно от заглушки.
         blocked = await _wait_out_challenge(cdp, sid)
 
-        result = Rendered(url=url, title="", text="", status=status.get("code"), blocked=blocked)
+        done: list[str] = []
+        actions_ok = True
+        if actions and blocked is None:
+            done, actions_ok = await _perform(cdp, sid, actions, loading)
+            # Нажатие могло увести на другую страницу, а она — оказаться проверкой.
+            blocked = await _wait_out_challenge(cdp, sid)
+
+        if full_page:
+            await _scroll_through(cdp, sid)
+
+        result = Rendered(
+            url=url, title="", text="", status=status.get("code"), blocked=blocked,
+            actions_done=done, actions_ok=actions_ok,
+        )
         if want_details:
             evaluated = await cdp.send(
                 "Runtime.evaluate",
@@ -720,6 +1026,143 @@ async def _scroll_through(cdp: _Cdp, sid: str) -> None:
             "Runtime.evaluate", {"expression": "window.scrollTo(0, 0); 0"}, session_id=sid, timeout=10
         )
     await asyncio.sleep(0.5)
+
+
+class _Loading:
+    """Грузится ли сейчас основная рамка — чтобы после нажатия дождаться перехода."""
+
+    def __init__(self) -> None:
+        self.frame_id = ""
+        self.idle = asyncio.Event()
+        self.idle.set()
+
+
+async def _evaluate(cdp: _Cdp, sid: str, expression: str, timeout: float = 15.0) -> Any:
+    reply = await cdp.send(
+        "Runtime.evaluate", {"expression": expression, "returnByValue": True},
+        session_id=sid, timeout=timeout,
+    )
+    if reply.get("exceptionDetails"):
+        details = reply["exceptionDetails"]
+        raise BrowserError(str((details.get("exception") or {}).get("description") or details.get("text"))[:200])
+    return (reply.get("result") or {}).get("value")
+
+
+async def _perform(
+    cdp: _Cdp, sid: str, actions: list[Action], loading: _Loading,
+) -> tuple[list[str], bool]:
+    """Проигрывает действия по порядку. На первой неудаче останавливается:
+    дальше путь всё равно бы разошёлся с тем, что задумал агент."""
+    done: list[str] = []
+    for index, action in enumerate(actions, 1):
+        try:
+            # После перехода на новую страницу правку надо ставить заново.
+            with contextlib.suppress(BrowserError, asyncio.TimeoutError):
+                await _evaluate(cdp, sid, _SAME_TAB_JS)
+            note = await _act(cdp, sid, action)
+        except _ActionFailed as exc:
+            done.append(f"{index}. Не вышло: {exc}. Дальше не продолжал.")
+            return done, False
+        except (BrowserError, asyncio.TimeoutError) as exc:
+            done.append(f"{index}. Не вышло: браузер ответил ошибкой ({exc or type(exc).__name__}). Дальше не продолжал.")
+            return done, False
+        if action.kind != "wait":
+            await _settle_after(loading)
+        done.append(f"{index}. {note}")
+    return done, True
+
+
+async def _settle_after(loading: _Loading) -> None:
+    # Переход начинается не мгновенно после нажатия: даём ему стартовать.
+    await asyncio.sleep(0.5)
+    if not loading.idle.is_set():
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(loading.idle.wait(), timeout=ACTION_NAV_WAIT)
+    await asyncio.sleep(ACTION_SETTLE)
+
+
+async def _act(cdp: _Cdp, sid: str, action: Action) -> str:
+    if action.kind == "wait":
+        return await _wait_for(cdp, sid, action)
+    if action.kind == "press":
+        name, code, text = _key(action.text) or _KEYS["enter"]
+        await _press(cdp, sid, name, code, text)
+        return f"нажал клавишу {name.strip() or 'Space'}"
+    if action.kind == "scroll" and not action.target:
+        height = await _evaluate(
+            cdp, sid,
+            "window.scrollTo(0, document.documentElement.scrollHeight); document.documentElement.scrollHeight",
+        )
+        return f"прокрутил в самый низ (высота страницы {height})"
+
+    mode = {"type": "input", "select": "select"}.get(action.kind, "click")
+    spot = await _evaluate(cdp, sid, f"({_LOCATE_JS})({json.dumps(mode)}, {json.dumps(action.target)})")
+    if isinstance(spot, dict) and spot.get("error"):
+        raise _ActionFailed(f"{spot['error']} «{action.target}»")
+    if not isinstance(spot, dict):
+        if action.kind == "type" and not action.target:
+            raise _ActionFailed("на странице не нашлось поля для ввода")
+        raise _ActionFailed(f"на странице нет элемента «{action.target}»")
+    where = f"{spot.get('desc')} (на высоте {spot.get('top')})"
+
+    if action.kind == "scroll":
+        return f"прокрутил к {where}"
+    if action.kind == "select":
+        chosen = await _evaluate(cdp, sid, f"({_SELECT_OPTION_JS})({json.dumps(action.text)})")
+        if not chosen:
+            raise _ActionFailed(f"в списке {spot.get('desc')} нет пункта «{action.text}»")
+        return f"выбрал «{chosen}» в {where}"
+
+    await _click(cdp, sid, spot)
+    if action.kind == "click":
+        return f"нажал {where}"
+    await asyncio.sleep(0.3)
+    if not await _evaluate(cdp, sid, _FOCUS_INPUT_JS):
+        raise _ActionFailed(f"поле {spot.get('desc')} не принимает ввод")
+    await cdp.send("Input.insertText", {"text": action.text}, session_id=sid)
+    return f"ввёл «{action.text[:60]}» в {where}"
+
+
+async def _click(cdp: _Cdp, sid: str, spot: dict[str, Any]) -> None:
+    if spot.get("covered"):
+        # Поверх элемента что-то лежит — баннер про cookies, всплывашка.
+        # Настоящий клик попал бы в неё, поэтому нажимаем сам элемент.
+        await _evaluate(cdp, sid, "window.__vkbotTarget && window.__vkbotTarget.click(); 0")
+        return
+    x, y = float(spot.get("x") or 0), float(spot.get("y") or 0)
+    await cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, session_id=sid)
+    for kind in ("mousePressed", "mouseReleased"):
+        await cdp.send(
+            "Input.dispatchMouseEvent",
+            {"type": kind, "x": x, "y": y, "button": "left", "clickCount": 1},
+            session_id=sid,
+        )
+
+
+async def _press(cdp: _Cdp, sid: str, name: str, code: int, text: str) -> None:
+    base = {"key": name, "code": "Space" if name == " " else name,
+            "windowsVirtualKeyCode": code, "nativeVirtualKeyCode": code}
+    # С символом — keyDown (страница получит и keypress), без — rawKeyDown.
+    down = dict(base, type="keyDown", text=text, unmodifiedText=text) if text else dict(base, type="rawKeyDown")
+    await cdp.send("Input.dispatchKeyEvent", down, session_id=sid)
+    await cdp.send("Input.dispatchKeyEvent", dict(base, type="keyUp"), session_id=sid)
+
+
+async def _wait_for(cdp: _Cdp, sid: str, action: Action) -> str:
+    seconds = action.seconds or (8.0 if action.text else 2.0)
+    if not action.text:
+        await asyncio.sleep(seconds)
+        return f"подождал {seconds:g} с"
+    wanted = action.text.strip().lower()
+    deadline = asyncio.get_running_loop().time() + seconds
+    while True:
+        with contextlib.suppress(BrowserError, asyncio.TimeoutError):
+            body = await _evaluate(cdp, sid, "(document.body && document.body.innerText) || ''", timeout=10)
+            if wanted in str(body).lower():
+                return f"дождался текста «{action.text[:60]}»"
+        if asyncio.get_running_loop().time() >= deadline:
+            return f"за {seconds:g} с текст «{action.text[:60]}» на странице так и не появился"
+        await asyncio.sleep(0.5)
 
 
 async def _page_start(cdp: _Cdp, sid: str) -> str:

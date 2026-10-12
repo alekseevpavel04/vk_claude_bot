@@ -9,6 +9,7 @@
 - wine_search — рейтинги Vivino сразу пачкой (на фото с полки вин десяток);
 - page_read — открыть страницу настоящим браузером: текст, картинки, ссылки;
 - page_screenshot — снять страницу и посмотреть на неё глазами (через Read);
+  оба умеют перед этим действовать на странице: нажать, ввести, выбрать;
 - save_image — забрать картинку со страницы к себе, чтобы разглядеть;
 - send_photo / send_file — прислать человеку картинку или файл в переписку.
 
@@ -57,6 +58,8 @@ PAGE_IMAGES_SHOWN = 12
 PAGE_LINKS_SHOWN = 12
 
 BROWSER_TIMEOUT = 120
+# С действиями на странице: каждое может увести на новую страницу и ждать её.
+BROWSER_ACTIONS_TIMEOUT = 200
 DOWNLOAD_TIMEOUT = 90
 
 _IMAGE_TYPES = {
@@ -93,6 +96,46 @@ class ToolContext:
     @property
     def peer_dir(self) -> Path:
         return self.media_dir / str(self.peer_id)
+
+
+# Действия на странице — общая часть схемы page_read и page_screenshot.
+_ACTIONS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "description": (
+        "Что сделать на странице после загрузки, по порядку, до "
+        f"{browser.MAX_ACTIONS} шагов: нажать кнопку или вкладку, ввести запрос в "
+        "поиск сайта, нажать Enter, выбрать пункт списка, прокрутить. Браузер "
+        "каждый вызов открывает url заново, так что передавай весь путь от него "
+        "целиком. Ответ перечислит, что получилось."
+    ),
+    "items": {
+        "type": "object",
+        "properties": {
+            "do": {
+                "type": "string",
+                "enum": list(browser.ACTION_KINDS),
+                "description": (
+                    "click — нажать target; type — ввести text в поле target; "
+                    "press — нажать клавишу text (Enter, Escape, Tab, ArrowDown, PageDown); "
+                    "select — выбрать пункт text в выпадающем списке target; "
+                    "scroll — прокрутить к target, а без target в самый низ; "
+                    "wait — подождать seconds секунд или пока на странице не появится text."
+                ),
+            },
+            "target": {
+                "type": "string",
+                "description": (
+                    "Видимый текст элемента (надпись на кнопке, вкладке, ссылке), "
+                    "подпись или placeholder поля. Можно CSS-селектор с приставкой "
+                    "«css:». Для type пустой target — поле поиска или то, где курсор."
+                ),
+            },
+            "text": {"type": "string", "description": "Что ввести, какую клавишу нажать или какой пункт выбрать."},
+            "seconds": {"type": "number", "description": "Для wait: сколько ждать, до 10 секунд."},
+        },
+        "required": ["do"],
+    },
+}
 
 
 def _ok(text: str) -> dict[str, Any]:
@@ -184,11 +227,14 @@ def build_server(context: ToolContext) -> Any:
         "нажимать дальше. Страницы выдачи поисковиков (google.com/search, "
         "yandex.ru/search) открывать бесполезно — они закрыты от автоматики, для "
         "поиска есть WebSearch. Часть сайтов может не пустить браузер вовсе: тогда "
-        "так и скажи человеку, не пересказывая заглушку.",
+        "так и скажи человеку, не пересказывая заглушку. Через actions можно "
+        "действовать на странице: искать по сайту, открыть вкладку «Состав» или "
+        "«Характеристики», нажать «Показать ещё».",
         {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "Полный адрес страницы (http или https)."},
+                "actions": _ACTIONS_SCHEMA,
             },
             "required": ["url"],
         },
@@ -198,12 +244,17 @@ def build_server(context: ToolContext) -> Any:
         problem = await url_problem(url)
         if problem:
             return _fail(problem)
+        try:
+            actions = browser.parse_actions(args.get("actions"))
+        except ValueError as exc:
+            return _fail(str(exc))
         special = await _special_site(context, url)
         if special is not None:
             return special
         try:
             page = await asyncio.wait_for(
-                browser.render(url, want_details=True), timeout=BROWSER_TIMEOUT
+                browser.render(url, want_details=True, actions=actions),
+                timeout=BROWSER_ACTIONS_TIMEOUT if actions else BROWSER_TIMEOUT,
             )
         except asyncio.TimeoutError:
             return _fail("Страница не открылась за отведённое время.")
@@ -264,6 +315,7 @@ def build_server(context: ToolContext) -> Any:
                     "description": "С какой высоты в точках начинать снимок. Нужен, чтобы досмотреть "
                                    "длинную страницу: предыдущий ответ говорит, на чём остановился.",
                 },
+                "actions": _ACTIONS_SCHEMA,
             },
             "required": ["url"],
         },
@@ -273,6 +325,10 @@ def build_server(context: ToolContext) -> Any:
         problem = await url_problem(url)
         if problem:
             return _fail(problem)
+        try:
+            actions = browser.parse_actions(args.get("actions"))
+        except ValueError as exc:
+            return _fail(str(exc))
         special = await _special_site(context, url)
         if special is not None:
             return special
@@ -292,8 +348,9 @@ def build_server(context: ToolContext) -> Any:
                     full_page=full_page,
                     start_at=start_at,
                     want_details=True,
+                    actions=actions,
                 ),
-                timeout=BROWSER_TIMEOUT,
+                timeout=BROWSER_ACTIONS_TIMEOUT if actions else BROWSER_TIMEOUT,
             )
         except asyncio.TimeoutError:
             return _fail("Страница не открылась за отведённое время.")
@@ -435,6 +492,10 @@ async def _special_site(context: ToolContext, url: str) -> dict[str, Any] | None
 
 def _page_header(page: browser.Rendered) -> str:
     head = f"Страница: {page.title or 'без заголовка'}\nАдрес: {page.url}"
+    if page.actions_done:
+        head += "\nЧто сделано на странице:\n" + "\n".join(page.actions_done)
+        if not page.actions_ok:
+            head += "\nНиже — страница в том состоянии, где действия остановились."
     if page.status and page.status >= 400:
         head += f"\nСервер ответил кодом {page.status} — содержимое может быть заглушкой."
     if page.blocked:
