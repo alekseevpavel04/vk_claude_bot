@@ -486,8 +486,13 @@ async def run_turn(
                     if isinstance(block, TextBlock) and block.text.strip():
                         collected.append(block.text.strip())
                     elif isinstance(block, ToolUseBlock):
-                        if block.name == "Read":
-                            target = block.input.get("file_path")
+                        # pdf_page тоже открытие: «пришли скриншот первой
+                        # страницы» агент делает им, не трогая Read, и иначе
+                        # _insist_on_files переиграл бы ход и прислал фото дважды.
+                        if block.name in ("Read", "mcp__bot__pdf_page"):
+                            target = block.input.get(
+                                "file_path" if block.name == "Read" else "path"
+                            )
                             if isinstance(target, str):
                                 opened.add(Path(target).name)
                         if on_tool is not None:
