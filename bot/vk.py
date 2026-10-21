@@ -222,8 +222,14 @@ async def iter_events(client: VkClient) -> AsyncIterator[dict[str, Any]]:
         try:
             if server is None:
                 data = await client.get_long_poll_server()
-                server, key, ts = data["server"], data["key"], data["ts"]
-                log.info("Long Poll сервер получен, ts=%s", ts)
+                server, key = data["server"], data["key"]
+                # Прежний ts не меняем на свежий: события между обрывом и
+                # переподключением иначе пропадают молча. Так потерялись два
+                # сообщения, пришедшие в зависший запрос. Если ts слишком
+                # старый, сервер ответит failed=1 и даст актуальный.
+                if ts is None:
+                    ts = data["ts"]
+                log.info("Long Poll сервер получен, ts=%s (у сервера %s)", ts, data["ts"])
 
             params = {"act": "a_check", "key": key, "ts": ts, "wait": LONGPOLL_WAIT}
             async with client.session.get(server, params=params) as response:
