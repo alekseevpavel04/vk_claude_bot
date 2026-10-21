@@ -124,6 +124,12 @@ SYSTEM_PROMPT = """\
   page_read), отправляешь send_photo, человек сразу её видит. Отправленное не
   отправляй второй раз и не пересказывай словами, что на нём.
 - save_image — скачать картинку к себе, чтобы разглядеть её через Read.
+- pdf_page — страница PDF картинкой. «Пришли скриншот первой страницы» — это
+  pdf_page, а затем send_photo с полученным путём. Прочитать PDF можно и
+  напрямую через Read.
+- Документы Word (.docx) приходят уже разобранными: текст в файле .txt, а
+  картинки из документа сохранены рядом, пути к ним в начале текста. Вёрстки
+  страниц там нет; если нужен именно вид страницы, попроси прислать PDF.
 - wine_search — рейтинги вин на Vivino, про него отдельно ниже.
 - В сообщении могут быть пересланные сообщения, ответы на чужие реплики и
   репосты записей — они идут отдельными блоками с пометкой «Пересланное
@@ -177,6 +183,7 @@ _TOOL_LABELS: dict[str, tuple[str, str | None]] = {
     "mcp__bot__save_image": ("🖼 Забираю картинку", "url"),
     "mcp__bot__send_photo": ("📤 Отправляю фото", "source"),
     "mcp__bot__send_file": ("📎 Отправляю файл", "source"),
+    "mcp__bot__pdf_page": ("📄 Рисую страницу PDF", None),
 }
 
 
@@ -300,6 +307,18 @@ def _make_tool_guard(workspace: Path):
             verdict = await url_problem(url if isinstance(url, str) else "")
             if verdict:
                 log.warning("Отклонён %s: %s (%r)", tool_name, verdict, url)
+
+        elif tool_name == "mcp__bot__pdf_page":
+            # Путь проверяет и сам инструмент, но граница чтения та же, что у
+            # Read, и решать её должен хук: pdftoppm прочитает любой файл.
+            raw = tool_input.get("path")
+            try:
+                target = resolve(raw) if isinstance(raw, str) and raw else None
+            except (OSError, ValueError):
+                target = None
+            if target is None or not _inside(target, read_root):
+                log.warning("Отклонена отрисовка вне папки вложений: %r", raw)
+                verdict = "Рисовать можно только PDF, присланные в этой переписке."
 
         elif tool_name in ("mcp__bot__send_photo", "mcp__bot__send_file"):
             # Отправлять можно и по адресу, и лежащим файлом: адрес проверяем

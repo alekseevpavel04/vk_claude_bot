@@ -20,10 +20,14 @@ ARG CLAUDE_CODE_VERSION=2.1.294
 # экран. Берём системный пакет Debian, а не сборку Playwright: та тянет за собой
 # node-драйвер и полгигабайта своего браузера, а нам нужен один бинарник.
 # Шрифты обязательны: без них вместо текста на снимке будут пустые квадраты.
+#
+# poppler-utils — pdftoppm и pdfinfo. Без него Read не рисует страницы PDF
+# («pdftoppm is not installed»), и на него же опирается pdf_page.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 python3-venv ca-certificates git \
         chromium fonts-liberation fonts-dejavu-core fonts-noto-color-emoji \
+        poppler-utils \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force

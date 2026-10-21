@@ -16,8 +16,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from xml.etree.ElementTree import ParseError as ElementTreeError
 
 import aiohttp
+
+from . import documents
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +35,20 @@ READABLE_EXTENSIONS = {
 # и в чате видно «Смотрю: 20260810-152037-9-0-____________.txt».
 _UNSAFE = re.compile(r"[^\w.-]", re.UNICODE)
 
+# Что Read сам не читает, но бот переводит в читаемое: .docx разбирается в
+# текст и картинки (bot/documents.py).
+CONVERTIBLE_EXTENSIONS = {"docx"}
+
 _OVER_BUDGET = "не скачано: в одном сообщении слишком много вложений"
+
+# Сколько раз пробовать скачать вложение. Хранилище ВК при сбоях отвечает
+# заглушкой «temporarily unavailable», а с третьей попытки отдаёт файл.
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_RETRY_DELAY = 2.0
+
+
+class _Retry(RuntimeError):
+    """Сбой на стороне ВК, который имеет смысл повторить."""
 
 
 @dataclass(frozen=True)
@@ -261,7 +277,13 @@ class MediaStore:
             ext = (body.get("ext") or "").lower()
             title = body.get("title") or "документ"
             url = body.get("url")
-            if ext not in READABLE_EXTENSIONS:
+            if ext == "doc":
+                return Attachment(
+                    kind="doc",
+                    note=f"файл {title} в старом формате .doc — его прочитать нельзя; "
+                    "попроси пересохранить в .docx или PDF",
+                )
+            if ext not in READABLE_EXTENSIONS and ext not in CONVERTIBLE_EXTENSIONS:
                 return Attachment(kind="doc", note=f"файл {title} (.{ext}) — формат не читается")
             if not url:
                 return Attachment(kind="doc", note=f"файл {title} — ВК не дал ссылку")
@@ -270,6 +292,15 @@ class MediaStore:
             path = await self._download(
                 peer_id, message_id, index, url, default_ext=ext, stem=title, budget=budget
             )
+            if ext in CONVERTIBLE_EXTENSIONS:
+                try:
+                    text, _images = await asyncio.to_thread(
+                        documents.extract_docx, path, self._max_bytes
+                    )
+                except (documents.DocumentError, ElementTreeError) as exc:
+                    log.warning("Не разобрался документ %s: %s", path.name, exc)
+                    return Attachment(kind="doc", note=f"файл {title} — не удалось разобрать: {exc}")
+                return Attachment(kind="doc", path=text)
             return Attachment(kind="doc", path=path)
 
         if kind == "audio_message":
@@ -322,11 +353,35 @@ class MediaStore:
             base = "photo"
         path = target_dir / f"{stamp}-{message_id}-{index}-{base}.{default_ext}"
 
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            try:
+                written = await self._fetch(url, path, limit, default_ext)
+                break
+            except (_Retry, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                # 404 и прочие 4xx повтором не лечатся: 5xx и 429 сюда
+                # приходят как _Retry.
+                if attempt == DOWNLOAD_ATTEMPTS or isinstance(exc, aiohttp.ClientResponseError):
+                    raise
+                log.warning("Вложение не скачалось (%s), попытка %s", exc, attempt + 1)
+                await asyncio.sleep(DOWNLOAD_RETRY_DELAY * attempt)
+
+        budget.files_left -= 1
+        budget.bytes_left -= written
+        log.info("Скачано вложение %s (%s байт)", path.name, written)
+        return path
+
+    async def _fetch(self, url: str, path: Path, limit: int, ext: str) -> int:
+        """Одна попытка скачать файл. Возвращает число записанных байт."""
         # Любой сбой посреди загрузки не должен оставлять обрезанный файл: Claude
         # прочитал бы его как настоящий и молча ответил по половине данных.
         try:
             async with self._session.get(url) as response:
+                if response.status >= 500 or response.status == 429:
+                    raise _Retry(f"ВК ответил {response.status}")
                 response.raise_for_status()
+                # Заглушка сбоя иногда приходит с кодом 200: страница вместо файла.
+                if response.content_type == "text/html" and ext not in ("html", "htm"):
+                    raise _Retry("ВК вернул страницу вместо файла")
 
                 declared = response.content_length
                 if declared is not None and declared > limit:
@@ -342,11 +397,7 @@ class MediaStore:
         except BaseException:
             path.unlink(missing_ok=True)
             raise
-
-        budget.files_left -= 1
-        budget.bytes_left -= written
-        log.info("Скачано вложение %s (%s байт)", path.name, written)
-        return path
+        return written
 
     # --- уборка ----------------------------------------------------------
 

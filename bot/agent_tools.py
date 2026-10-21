@@ -11,7 +11,8 @@
 - page_screenshot — снять страницу и посмотреть на неё глазами (через Read);
   оба умеют перед этим действовать на странице: нажать, ввести, выбрать;
 - save_image — забрать картинку со страницы к себе, чтобы разглядеть;
-- send_photo / send_file — прислать человеку картинку или файл в переписку.
+- send_photo / send_file — прислать человеку картинку или файл в переписку;
+- pdf_page — страница PDF картинкой: посмотреть глазами или прислать.
 
 Всё, что ходит в сеть по адресу от агента, проверяется netcheck: во внутреннюю
 сеть сервера (метаданные облака, соседи по хосту) хода нет ни у одного из них.
@@ -33,7 +34,7 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from . import browser, formatting, images, vivino, wildberries
+from . import browser, documents, formatting, images, vivino, wildberries
 from .netcheck import url_problem
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ TOOL_NAMES = (
     "save_image",
     "send_photo",
     "send_file",
+    "pdf_page",
 )
 FULL_TOOL_NAMES = tuple(f"mcp__{SERVER_NAME}__{name}" for name in TOOL_NAMES)
 
@@ -456,10 +458,49 @@ def build_server(context: ToolContext) -> Any:
     async def send_file(args: dict[str, Any]) -> dict[str, Any]:
         return await _send(context, args, as_document=True)
 
+    @tool(
+        "pdf_page",
+        "Сделать картинку одной страницы PDF из папки вложений (присланного или "
+        "скачанного). Чтобы посмотреть на страницу глазами — Read по пути из "
+        "ответа; чтобы прислать человеку («скинь скриншот первой страницы») — "
+        "send_photo с тем же путём.",
+        {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Путь к PDF в папке вложений."},
+                "page": {"type": "integer", "description": "Номер страницы, с единицы. По умолчанию 1."},
+            },
+            "required": ["path"],
+        },
+    )
+    async def pdf_page(args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            source = _resolve_local(context, str(args.get("path") or "").strip())
+        except _DownloadError as exc:
+            return _fail(str(exc))
+        if source.suffix.lower() != ".pdf":
+            return _fail("Это не PDF: страницы рисуются только у PDF.")
+        try:
+            page = max(1, int(args.get("page") or 1))
+        except (TypeError, ValueError):
+            return _fail("Номер страницы — целое число с единицы.")
+        context.peer_dir.mkdir(parents=True, exist_ok=True)
+        base = _UNSAFE.sub("_", source.stem)[-40:]
+        target = context.peer_dir / f"{_stamp()}-{base}-p{page}.png"
+        try:
+            path = await documents.render_pdf_page(source, page, target)
+        except documents.DocumentError as exc:
+            return _fail(f"Не получилось: {exc}.")
+        await _cleanup(context)
+        return _ok(
+            f"Страница {page} сохранена картинкой: {path}. Посмотреть — Read по этому "
+            "пути, прислать человеку — send_photo с тем же путём."
+        )
+
     return create_sdk_mcp_server(
         name=SERVER_NAME,
         version="1.0.0",
-        tools=[wine_search, page_read, page_screenshot, save_image, send_photo, send_file],
+        tools=[wine_search, page_read, page_screenshot, save_image, send_photo, send_file, pdf_page],
     )
 
 
