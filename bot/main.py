@@ -66,6 +66,12 @@ CHAT_PEER_BASE = 2_000_000_000
 # Сколько id обработанных сообщений помнить ради защиты от повторов.
 SEEN_MESSAGES_LIMIT = 500
 
+# Догон пропущенного: сколько последних сообщений переписки смотреть и какой
+# давности вопрос ещё имеет смысл поднимать. Вопрос, заданный до перерыва в
+# несколько часов, человек скорее задаст заново, чем ждёт ответа на него.
+CATCH_UP_HISTORY = 20
+CATCH_UP_MAX_AGE = 3600
+
 # Сколько вопросов может ждать своей очереди у одного собеседника.
 QUEUE_LIMIT = 5
 
@@ -623,6 +629,33 @@ class Bot:
         if worker.busy and worker.queued == 1:
             await self.reply(peer_id, "Занят предыдущим вопросом — отвечу на этот следом.")
 
+    async def catch_up(self) -> None:
+        """Дочитывает вопросы, пришедшие мимо Long Poll.
+
+        Зовётся при старте и когда ВК сообщил, что события потеряны. Берёт
+        входящие после последнего ответа бота в каждой разрешённой переписке
+        и отдаёт их в dispatch как обычные события. Уже разобранное отсеет
+        _is_duplicate, так что лишний вызов безопасен.
+        """
+        now = time.time()
+        for peer_id in sorted(self.config.allowed_user_ids):
+            try:
+                history = await self.vk.get_history(peer_id, CATCH_UP_HISTORY)
+            except Exception as exc:  # noqa: BLE001 — догон не повод ронять приём
+                log.warning("Не удалось дочитать переписку %s: %s", peer_id, exc)
+                continue
+            missed: list[dict[str, Any]] = []
+            for message in history:  # от новых к старым
+                if message.get("out") or now - int(message.get("date", 0)) > CATCH_UP_MAX_AGE:
+                    break
+                missed.append(message)
+            fresh = [m for m in missed if int(m.get("id", 0)) not in self._seen]
+            if not fresh:
+                continue
+            log.warning("Дочитываю пропущенные сообщения от %s: %s", peer_id, len(fresh))
+            for message in reversed(fresh):
+                await self.dispatch({"type": "message_new", "object": {"message": message}})
+
     def _worker(self, peer_id: int) -> PeerWorker:
         worker = self._workers.get(peer_id)
         if worker is None:
@@ -940,7 +973,9 @@ async def _prune_loop(bot: Bot, interval_seconds: int = 3600) -> None:
 
 
 async def _poll(bot: Bot, vk: VkClient) -> None:
-    async for update in iter_events(vk):
+    # Что пришло, пока бот перезапускался, Long Poll уже не отдаст.
+    await bot.catch_up()
+    async for update in iter_events(vk, on_gap=bot.catch_up):
         try:
             await bot.dispatch(update)
         except Exception:  # noqa: BLE001 — одно кривое событие не должно ронять цикл

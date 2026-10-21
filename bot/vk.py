@@ -11,7 +11,7 @@ import json
 import logging
 import mimetypes
 import random
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +118,12 @@ class VkClient:
         items = response.get("items") or []
         return [item for item in items if isinstance(item, dict)]
 
+    async def get_history(self, peer_id: int, count: int = 20) -> list[dict[str, Any]]:
+        """Последние сообщения переписки, от новых к старым."""
+        response = await self.call("messages.getHistory", peer_id=peer_id, count=count)
+        items = response.get("items") or []
+        return [item for item in items if isinstance(item, dict)]
+
     # --- отправка файлов -------------------------------------------------
     #
     # Схема у ВК одинаковая для всего: спросить адрес сервера загрузки,
@@ -206,13 +212,20 @@ class VkClient:
         return await self.call("groups.getLongPollServer", group_id=self.group_id)
 
 
-async def iter_events(client: VkClient) -> AsyncIterator[dict[str, Any]]:
+async def iter_events(
+    client: VkClient,
+    on_gap: Callable[[], Awaitable[None]] | None = None,
+) -> AsyncIterator[dict[str, Any]]:
     """Бесконечно отдаёт события сообщества из Long Poll.
 
     Коды `failed` из ответа сервера:
       1 — история устарела, взять новый ts из ответа;
       2 — истёк key, перезапросить сервер;
       3 — потеряна информация, перезапросить сервер и ts.
+
+    При 1 и 3 часть событий пропала безвозвратно: так бывает, если ВК лежал
+    дольше, чем хранит историю. Тогда зовётся `on_gap`, чтобы дочитать
+    пропущенное другим путём.
     """
     server = key = None
     ts: str | None = None
@@ -238,14 +251,18 @@ async def iter_events(client: VkClient) -> AsyncIterator[dict[str, Any]]:
             backoff = 1
 
             failed = payload.get("failed")
-            if failed == 1:
-                ts = payload["ts"]
+            if failed in (1, 3):
+                log.warning("Long Poll failed=%s: события за обрыв потеряны", failed)
+                if failed == 1:
+                    ts = payload["ts"]
+                else:
+                    server = key = ts = None
+                if on_gap is not None:
+                    await on_gap()
                 continue
-            if failed in (2, 3):
-                log.info("Long Poll failed=%s, перезапрашиваю сервер", failed)
+            if failed == 2:
+                log.info("Long Poll failed=2, перезапрашиваю сервер")
                 server = key = None
-                if failed == 3:
-                    ts = None
                 continue
             if failed is not None:
                 log.error("Неизвестный failed=%s, перезапрашиваю сервер", failed)
