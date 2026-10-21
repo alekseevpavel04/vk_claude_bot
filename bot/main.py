@@ -20,6 +20,7 @@ from . import agent_tools, claude_runner, formatting
 from .config import MESSAGE_LIMIT, Config, ConfigError, load_config
 from .http import make_session
 from .media import MediaStore, MessagePart
+from .reports import LogTail, ReportStore, TurnTrace, clip
 from .sessions import SessionStore
 from .vk import VkClient, iter_events
 
@@ -51,6 +52,8 @@ HELP_TEXT = """\
 /limits — сколько потрачено лимитов подписки и когда обнулятся
 /status — чем занят прямо сейчас
 /clear — полная очистка: все разговоры и все файлы
+/bug что не так — что-то сломалось: сохраню отчёт вместе с технической
+  записью последнего ответа, чтобы потом починить
 /help — это сообщение
 
 Предупрежу сам, когда расход подойдёт к лимиту. Раньше этого Claude процент не
@@ -260,6 +263,9 @@ class PeerWorker:
             enforce_cap=bot.media.enforce_total_cap,
         )
 
+        trace = TurnTrace(started=time.time(), prompt=prompt, outcome="не завершён: прерван или ещё идёт")
+        bot.last_turn[self.peer_id] = trace
+
         try:
             result = await asyncio.wait_for(
                 claude_runner.run_turn(
@@ -277,6 +283,8 @@ class PeerWorker:
             )
         except asyncio.TimeoutError:
             log.warning("Ход для %s не уложился в %s с — прерываю", self.peer_id, TURN_TIMEOUT)
+            trace.outcome = f"прерван по таймауту {TURN_TIMEOUT} с"
+            bot.record_errors(self.peer_id, [("ход", trace.outcome)])
             await progress.finish()
             await self._say(
                 self.peer_id,
@@ -289,12 +297,24 @@ class PeerWorker:
             bot.sessions.remember(self.peer_id, result.session_id)
         alerts = bot.remember_limits(result.rate_limits)
 
+        trace.steps = list(result.steps)
+        errors = list(result.tool_errors)
         retry = await self._insist_on_files(result, tools_context, progress)
         if retry is not None:
+            trace.steps += ["-- повтор: агент не открыл присланные файлы --", *retry.steps]
+            errors += retry.tool_errors
             result = retry
             if result.session_id:
                 bot.sessions.remember(self.peer_id, result.session_id)
             alerts += bot.remember_limits(result.rate_limits)
+
+        trace.answer = result.text
+        trace.outcome = "с ошибкой" if result.is_error else "завершён"
+        if result.unread_files:
+            trace.outcome += ", не открыты: " + ", ".join(p.name for p in result.unread_files)
+        if result.is_error:
+            errors.append(("ход", result.text))
+        bot.record_errors(self.peer_id, errors)
 
         # Ответ — всегда новое сообщение, следом за заметкой о ходе работы.
         await progress.finish()
@@ -472,11 +492,15 @@ class Bot:
         media: MediaStore,
         sessions: SessionStore,
         shutdown: asyncio.Event | None = None,
+        reports: ReportStore | None = None,
     ) -> None:
         self.config = config
         self.vk = vk
         self.media = media
         self.sessions = sessions
+        self.reports = reports
+        # Последний ход по собеседникам — его прикладывает к отчёту /bug.
+        self.last_turn: dict[int, TurnTrace] = {}
         self.shutdown = shutdown or asyncio.Event()
         # True, если выключение запрошено командой /stop, а не сигналом ОС.
         self.killed = False
@@ -656,6 +680,34 @@ class Bot:
             for message in reversed(fresh):
                 await self.dispatch({"type": "message_new", "object": {"message": message}})
 
+    def record_errors(self, peer_id: int, errors: list[tuple[str, str]]) -> None:
+        if self.reports is not None and errors:
+            self.reports.record_errors(peer_id, errors)
+
+    async def _bug(self, peer_id: int, text: str) -> None:
+        if self.reports is None:
+            await self.reply(peer_id, "Отчёты здесь не настроены.")
+            return
+        refusal = self.reports.bug_refusal(peer_id)
+        if refusal:
+            await self.reply(peer_id, refusal)
+            return
+        parts = text.split(maxsplit=1)
+        comment = clip(parts[1], 4000) if len(parts) > 1 else ""
+        path = await asyncio.to_thread(
+            self.reports.save_bug, peer_id, comment, self.last_turn.get(peer_id)
+        )
+        if path is None:
+            await self.reply(peer_id, "Не получилось сохранить отчёт, подробности в логе.")
+        elif comment:
+            await self.reply(peer_id, "Записал, вместе с технической записью последнего ответа.")
+        else:
+            await self.reply(
+                peer_id,
+                "Записал техническую запись последнего ответа. В следующий раз допиши после "
+                "/bug, что не так: так быстрее разобраться.",
+            )
+
     def _worker(self, peer_id: int) -> PeerWorker:
         worker = self._workers.get(peer_id)
         if worker is None:
@@ -697,6 +749,10 @@ class Bot:
                 peer_id,
                 "Контекст сброшен, начинаем заново." if had else "Контекста и так не было. Спрашивай.",
             )
+            return True
+
+        if command in {"bug", "баг"}:
+            await self._bug(peer_id, text)
             return True
 
         if command in {"cancel", "отмена"}:
@@ -923,7 +979,10 @@ async def run() -> None:
 
         stop = asyncio.Event()
         _install_signal_handlers(stop)
-        bot = Bot(config, vk, media, sessions, shutdown=stop)
+        tail = LogTail()
+        logging.getLogger().addHandler(tail)
+        reports = ReportStore(config.workspace / "reports", tail)
+        bot = Bot(config, vk, media, sessions, shutdown=stop, reports=reports)
 
         media.purge_once()
         await _prune_sessions(bot)

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -27,13 +28,16 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
     delete_session,
     list_sessions,
     query,
 )
 
 from . import agent_tools
+from .reports import clip, tool_result_text
 from .netcheck import url_problem
 
 log = logging.getLogger(__name__)
@@ -69,6 +73,9 @@ _SECRET_ENV_KEYS = ("VK_TOKEN", "ALLOWED_USER_IDS", "VK_GROUP_ID")
 # Потолок JSON-сообщения между SDK и CLI. Файл едет в base64 (+33% к размеру),
 # поэтому берём с запасом над MAX_ATTACHMENT_MB (20 МБ по умолчанию).
 MAX_BUFFER_BYTES = 48 * 1024 * 1024
+
+# Сколько шагов хода запоминать для отчёта /bug.
+MAX_TRACE_STEPS = 40
 
 SYSTEM_PROMPT = """\
 Ты — личный ассистент одного человека. Вы переписываетесь ВКонтакте, он читает
@@ -197,6 +204,9 @@ class TurnResult:
     rate_limits: dict[str, RateLimitInfo] = field(default_factory=dict)
     # Присланные файлы, которые агент так и не открыл инструментом Read.
     unread_files: list[Path] = field(default_factory=list)
+    # Для отчёта /bug: вызовы инструментов по порядку и их ошибки.
+    steps: list[str] = field(default_factory=list)
+    tool_errors: list[tuple[str, str]] = field(default_factory=list)
 
 
 def describe_tool(block: ToolUseBlock) -> str | None:
@@ -471,6 +481,16 @@ async def run_turn(
     # и сверять достаточно имя файла — оно уникально по построению.
     awaited = {path.name: path for path in expect_files or []}
     opened: set[str] = set()
+    steps: list[str] = []
+    tool_errors: list[tuple[str, str]] = []
+    tool_names: dict[str, str] = {}
+
+    def step(line: str) -> None:
+        # Ход в 40 шагов не должен раздуть отчёт: хватает начала и счёта.
+        if len(steps) < MAX_TRACE_STEPS:
+            steps.append(clip(line, 300))
+        elif len(steps) == MAX_TRACE_STEPS:
+            steps.append("… дальше шаги не записаны")
 
     try:
         async for message in query(prompt=_as_stream(prompt), options=options):
@@ -486,6 +506,8 @@ async def run_turn(
                     if isinstance(block, TextBlock) and block.text.strip():
                         collected.append(block.text.strip())
                     elif isinstance(block, ToolUseBlock):
+                        tool_names[block.id] = block.name
+                        step(f"-> {block.name} {json.dumps(block.input, ensure_ascii=False)}")
                         # pdf_page тоже открытие: «пришли скриншот первой
                         # страницы» агент делает им, не трогая Read, и иначе
                         # _insist_on_files переиграл бы ход и прислал фото дважды.
@@ -499,6 +521,13 @@ async def run_turn(
                             note = describe_tool(block)
                             if note:
                                 await on_tool(note)
+            elif isinstance(message, UserMessage) and isinstance(message.content, list):
+                for block in message.content:
+                    if isinstance(block, ToolResultBlock) and block.is_error:
+                        name = tool_names.get(block.tool_use_id, "?")
+                        error = tool_result_text(block.content)
+                        tool_errors.append((name, error))
+                        step(f"x {name}: {error}")
             elif isinstance(message, ResultMessage):
                 session_id = message.session_id
                 cost = message.total_cost_usd
@@ -528,18 +557,19 @@ async def run_turn(
         if limit_note:
             return TurnResult(
                 text=limit_note, session_id=session_id, is_error=True,
-                cost_usd=cost, rate_limits=limits,
+                cost_usd=cost, rate_limits=limits, steps=steps, tool_errors=tool_errors,
             )
         if not (result_text or collected):
             return TurnResult(
                 text=f"Claude прервал работу: {exc}", session_id=session_id, is_error=True,
-                cost_usd=cost, rate_limits=limits,
+                cost_usd=cost, rate_limits=limits, steps=steps, tool_errors=tool_errors,
             )
         is_error = True
 
     if fatal:
         return TurnResult(
-            text=fatal, session_id=session_id, is_error=True, cost_usd=cost, rate_limits=limits
+            text=fatal, session_id=session_id, is_error=True, cost_usd=cost, rate_limits=limits,
+            steps=steps, tool_errors=tool_errors,
         )
 
     text = (result_text or "").strip() or "\n\n".join(collected).strip()
@@ -558,7 +588,7 @@ async def run_turn(
 
     return TurnResult(
         text=text, session_id=session_id, is_error=is_error, cost_usd=cost,
-        rate_limits=limits, unread_files=unread,
+        rate_limits=limits, unread_files=unread, steps=steps, tool_errors=tool_errors,
     )
 
 
