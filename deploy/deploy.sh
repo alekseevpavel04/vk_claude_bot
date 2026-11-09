@@ -153,7 +153,10 @@ tidy_docker() {
     step "Убираю за сборкой"
     remote "${SUDO}docker image prune -f >/dev/null 2>&1 || true"
     remote "${SUDO}docker builder prune -f --max-used-space $BUILD_CACHE_LIMIT >/dev/null 2>&1 || true"
-    remote "${SUDO}docker system df | awk 'NR==1 || /Images|Build Cache/ {print \"  \" \$0}'"
+    # «Build Cache» из docker system df на хранилище containerd включает слои,
+    # общие с образом, и выглядит больше лимита. Своё у кэша — только Private.
+    remote "${SUDO}docker system df | awk '/^Images/ {print \"  образы: \" \$4}'"
+    remote "${SUDO}docker buildx du | awk '/^Private:/ {print \"  кэш сборки сверх образов: \" \$2 \" (лимит $BUILD_CACHE_LIMIT)\"}'"
 
     # Проверяем, что бот действительно работает на свежесобранном образе.
     local running built
