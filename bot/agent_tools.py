@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
 from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -63,6 +63,8 @@ BROWSER_TIMEOUT = 120
 # С действиями на странице: каждое может увести на новую страницу и ждать её.
 BROWSER_ACTIONS_TIMEOUT = 200
 DOWNLOAD_TIMEOUT = 90
+MAX_REDIRECTS = 5
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 
 _IMAGE_TYPES = {
     "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
@@ -561,6 +563,31 @@ class _DownloadError(RuntimeError):
     pass
 
 
+async def _get_checked(context: ToolContext, url: str) -> aiohttp.ClientResponse:
+    """GET с перенаправлениями вручную: каждый следующий адрес проверяется до запроса.
+
+    Сам aiohttp идёт по Location не спрашивая, и проверка итогового адреса
+    опаздывает: запрос во внутреннюю сеть к тому моменту уже ушёл.
+    """
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        response = await context.http.get(
+            current,
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT),
+            headers={"User-Agent": browser.USER_AGENT, "Accept": "*/*"},
+        )
+        location = response.headers.get("Location")
+        if response.status not in _REDIRECT_CODES or not location:
+            return response
+        response.release()
+        current = urljoin(str(response.url), location)
+        problem = await url_problem(current)
+        if problem:
+            raise _DownloadError(problem)
+    raise _DownloadError("Слишком много перенаправлений — файл не отдали.")
+
+
 async def _download(context: ToolContext, url: str, *, images_only: bool) -> tuple[Path, int]:
     """Скачивает файл по адресу в папку вложений этого собеседника."""
     problem = await url_problem(url)
@@ -570,17 +597,9 @@ async def _download(context: ToolContext, url: str, *, images_only: bool) -> tup
     target_dir = context.peer_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     try:
-        async with context.http.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT),
-            headers={"User-Agent": browser.USER_AGENT, "Accept": "*/*"},
-        ) as response:
+        async with await _get_checked(context, url) as response:
             if response.status >= 400:
                 raise _DownloadError(f"Сервер ответил кодом {response.status} — файл не отдали.")
-            # Хост мог оказаться внутренним после перенаправления.
-            final = await url_problem(str(response.url))
-            if final:
-                raise _DownloadError(final)
 
             content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if images_only and content_type not in _IMAGE_TYPES:
